@@ -4,9 +4,9 @@ A headless test of the [DVM Desktop Dispatch Console](https://github.com/DVMProj
 
 It exists to prove the networking, vocoder and audio work on Linux ARM64 before any decision about a full desktop port.
 
-**What works:** FNE login using your dvmconsole codeplug, call start/end on one P25 talkgroup, clear-voice decoding, playback through PipeWire, and recording to WAV.
+**What works:** FNE login using your dvmconsole codeplug, P25 receive and transmit (clear, AES-256, DES, ADP/ARC4 with keys from the FNE), PipeWire audio, a terminal console with toggle push-to-talk, and WAV recording.
 
-**Not yet:** encrypted calls (detected and muted), transmit, DMR/NXDN/analog, and any GUI.
+**Not yet:** DMR/NXDN/analog, and a graphical UI.
 
 ## Install on the Surface Pro 11
 
@@ -63,6 +63,27 @@ Other `listen` options:
 | `--verbose` | Log every network frame and fnecore debug messages |
 
 Press Ctrl+C to stop.
+
+## Terminal console (TUI)
+
+Start the terminal console for the codeplug's first system (or pick one with `--system NAME`):
+
+```bash
+./dvmcli tui --codeplug ~/dvm/codeplug-linux.yml
+```
+
+| Key | Action |
+|---|---|
+| ↑ / ↓, PgUp / PgDn, Home / End | Move between channels |
+| Enter | Select (listen to) or deselect the highlighted channel |
+| Space | Toggle transmit on the highlighted channel (press again to stop) |
+| Esc | Stop transmitting |
+| m | Mute or unmute the highlighted channel |
+| + / - | Volume of the highlighted channel |
+| k | Request the highlighted channel's key from the FNE again |
+| q | Quit |
+
+Transmit uses the default PipeWire microphone and the system's `rid` as the source ID. A secure channel never transmits in the clear: without its key, transmit is refused. Transmissions stop automatically after 120 seconds; change that with `--tx-limit SECONDS`. Add `--log FILE` to keep a copy of the log.
 
 ## Building from source
 
