@@ -19,9 +19,8 @@ namespace dvmcli
     /// <summary>
     /// FNE console peer for the CLI.
     /// </summary>
-    public sealed class CliPeer : fnecore.FneSystemBase
+    public sealed class CliPeer : fnecore.FneSystemBase, IP25TrafficSink
     {
-        private readonly P25VoiceReceiver receiver;
         private readonly KeyStore keys;
         private readonly bool verbose;
         private readonly uint consoleRid;
@@ -31,16 +30,21 @@ namespace dvmcli
         /// <summary>Raised with a status line for the user.</summary>
         public event Action<string> Status;
 
+        /// <summary>Raised on the network thread for every P25 frame from the FNE (all talkgroups).</summary>
+        public event Action<P25DataReceivedEvent> P25Frame;
+
         /// <summary>True once the master has accepted our login.</summary>
         public bool Connected { get; private set; }
+
+        /// <summary>The console RID from the codeplug (0 if missing); used as the source of key requests and transmissions.</summary>
+        public uint ConsoleRid => consoleRid;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="CliPeer"/> class.
         /// </summary>
-        public CliPeer(Codeplug.System system, P25VoiceReceiver receiver, KeyStore keys, bool verbose)
+        public CliPeer(Codeplug.System system, KeyStore keys, bool verbose)
             : base(CreatePeer(system), verbose ? LogLevel.DEBUG : LogLevel.INFO)
         {
-            this.receiver = receiver;
             this.keys = keys;
             this.verbose = verbose;
 
@@ -111,7 +115,7 @@ namespace dvmcli
             {
                 if (verbose)
                     Status?.Invoke($"p25 {e.DUID} src {e.SrcId} tg {e.DstId} stream {e.StreamId} ({e.Data.Length} bytes)");
-                receiver.Handle(e.DstId, e.SrcId, e.DUID, e.StreamId, e.Data);
+                P25Frame?.Invoke(e);
             }
             catch (Exception ex)
             {
@@ -205,6 +209,42 @@ namespace dvmcli
                     ? $"received {KeyStore.AlgorithmName(keyset.AlgId)} key 0x{key.KeyId:X4} from the FNE"
                     : $"ignored key 0x{key.KeyId:X4} with unsupported algorithm {KeyStore.AlgorithmName(keyset.AlgId)}");
             }
+        }
+
+        /*
+        ** Transmit (IP25TrafficSink)
+        */
+
+        /// <inheritdoc/>
+        public byte[] CreateP25Header(P25DUID duid, RemoteCallData callData, CryptoParams cryptoParams)
+        {
+            byte[] frame = new byte[P25FrameBuilder.FrameSize];
+            CreateP25MessageHdr((byte)duid, callData, ref frame, cryptoParams);
+            return frame;
+        }
+
+        /// <inheritdoc/>
+        public void SendP25Voice(byte[] frame, ushort packetSequence, uint streamId)
+        {
+            fne.SendMasterTraffic(FneBase.CreateOpcode(Constants.NET_FUNC_PROTOCOL, Constants.NET_PROTOCOL_SUBFUNC_P25),
+                                  frame, packetSequence, streamId);
+        }
+
+        /// <inheritdoc/>
+        public void SendP25Tdu(uint srcId, uint dstId, uint streamId, bool grantDemand)
+        {
+            RemoteCallData callData = new RemoteCallData
+            {
+                SrcId = srcId,
+                DstId = dstId,
+                LCO = P25Defines.LC_GROUP,
+                TxStreamID = streamId
+            };
+
+            // one grant demand to start; the console sends four TDUs to make sure the call end lands
+            int count = grantDemand ? 1 : 4;
+            for (int i = 0; i < count; i++)
+                SendP25TDU(callData, grantDemand);
         }
 
         /*

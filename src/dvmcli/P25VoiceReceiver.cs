@@ -102,6 +102,30 @@ namespace dvmcli
         /// <summary>Number of calls seen on the talkgroup.</summary>
         public int CallsSeen { get; private set; }
 
+        /// <summary>True while a call is in progress.</summary>
+        public bool InCall => streamId != 0;
+
+        /// <summary>Source radio of the current (or last) call.</summary>
+        public uint CurrentSource => sourceId;
+
+        /// <summary>Algorithm of the current call (0 = not known yet, 0x80 = clear).</summary>
+        public byte CurrentAlgorithm => algId;
+
+        /// <summary>Key ID of the current call.</summary>
+        public ushort CurrentKeyId => keyId;
+
+        /// <summary>When the current call started.</summary>
+        public DateTime CallStartedAt => callStarted;
+
+        /// <summary>True if any voice in the current call has been muted (no key, or before sync).</summary>
+        public bool CallHasMuted => callMuted > 0;
+
+        /// <summary>Raised when a call starts (source radio ID).</summary>
+        public event Action<uint> CallStarted;
+
+        /// <summary>Raised when a call ends: source, duration in seconds, frames played, frames muted, crypto description.</summary>
+        public event Action<uint, double, int, int, string> CallEnded;
+
         /// <summary>
         /// Initializes a new instance of the <see cref="P25VoiceReceiver"/> class.
         /// </summary>
@@ -318,6 +342,7 @@ namespace dvmcli
             decoder = new MBEDecoder(MBE_MODE.IMBE_88BIT);
 
             Status?.Invoke($"CALL START  src {srcId}  tg {talkgroup}  stream {newStreamId}");
+            CallStarted?.Invoke(srcId);
         }
 
         private void EndCall()
@@ -327,6 +352,7 @@ namespace dvmcli
             string muted = callMuted > 0 ? $", {callMuted} muted" : string.Empty;
             Status?.Invoke($"CALL END    src {sourceId}  tg {talkgroup}  {secs:F1} s, {crypt}, {callFrames} voice frames played{muted}");
             streamId = 0;
+            CallEnded?.Invoke(sourceId, secs, callFrames, callMuted, crypt);
         }
 
         /// <summary>

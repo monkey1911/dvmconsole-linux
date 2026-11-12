@@ -12,7 +12,7 @@
     <AssemblyName>dvmcli</AssemblyName>
     <RootNamespace>dvmcli</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <Version>0.2.1</Version>
+    <Version>0.3.0</Version>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -34,6 +34,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\extern\dvmconsole\fnecore\fnecore.csproj" />
     <PackageReference Include="YamlDotNet" Version="16.2.0" />
+    <PackageReference Include="Spectre.Console" Version="0.49.1" />
     <!-- only needed for a [JsonIgnore] attribute in Codeplug.cs; same version as dvmconsole -->
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>

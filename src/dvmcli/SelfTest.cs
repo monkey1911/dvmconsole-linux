@@ -164,7 +164,10 @@ namespace dvmcli
                       "key arriving mid-call unmutes from the next superframe after an LDU2");
             }
 
-            // 7. codeplug parsing (same settings as the console)
+            // 7. transmit: frames built for the FNE round-trip through the receiver
+            TransmitTests(codewords.Count);
+
+            // 8. codeplug parsing (same settings as the console)
             string tmp = Path.Combine(Path.GetTempPath(), $"dvmcli-selftest-{Environment.ProcessId}");
             Directory.CreateDirectory(tmp);
             try
@@ -197,6 +200,117 @@ namespace dvmcli
 
             Console.WriteLine(failures == 0 ? "ALL TESTS PASSED" : $"{failures} TEST(S) FAILED");
             return failures == 0 ? 0 : 1;
+        }
+
+        /// <summary>
+        /// Captures what a transmitter would send to the FNE; headers come from a real (offline) CliPeer.
+        /// </summary>
+        private sealed class CaptureSink : IP25TrafficSink
+        {
+            private readonly CliPeer headers;
+            public readonly List<(byte[] Frame, ushort Seq, uint Stream)> Voice = new();
+            public readonly List<(uint Src, uint Dst, uint Stream, bool Grant)> Tdus = new();
+
+            public CaptureSink(CliPeer headers) => this.headers = headers;
+            public byte[] CreateP25Header(P25DUID duid, fnecore.RemoteCallData callData, fnecore.CryptoParams cryptoParams) =>
+                headers.CreateP25Header(duid, callData, cryptoParams);
+            public void SendP25Voice(byte[] frame, ushort packetSequence, uint streamId) => Voice.Add(((byte[])frame.Clone(), packetSequence, streamId));
+            public void SendP25Tdu(uint srcId, uint dstId, uint streamId, bool grantDemand)
+            {
+                int count = grantDemand ? 1 : 4;   // as CliPeer does
+                for (int i = 0; i < count; i++)
+                    Tdus.Add((srcId, dstId, streamId, grantDemand));
+            }
+        }
+
+        private static void TransmitTests(int frames)
+        {
+            const uint rid = 9000001, tg = 504, secureTg = 500;
+
+            // expected codewords: the encoder is deterministic, so a fresh one gives the transmitter's output
+            MBEEncoder reference = new MBEEncoder(MBE_MODE.IMBE_88BIT);
+            List<short[]> pcm = Enumerable.Range(0, frames).Select(VoicedFrame).ToList();
+            List<byte[]> expected = pcm.Select(p => { byte[] c = new byte[P25VoiceReceiver.ImbeLength]; reference.encode(p, c); return c; }).ToList();
+
+            Codeplug.System offline = new Codeplug.System { Name = "Test", Identity = "TEST", Address = "127.0.0.1", Port = 62031, PeerId = rid, Rid = rid.ToString(), Password = "x" };
+            CliPeer headerPeer = new CliPeer(offline, new KeyStore(), verbose: false);
+            Check(headerPeer.ConsoleRid == rid, "peer reads the console RID from the codeplug");
+
+            // clear call
+            CaptureSink clear = new CaptureSink(headerPeer);
+            P25Transmitter tx = new P25Transmitter(clear, new KeyStore(), rid, tg, P25Defines.P25_ALGO_UNENCRYPT, 0);
+            Check(tx.Start(out string err1) && err1 == null, "clear transmit starts");
+            foreach (short[] p in pcm) tx.PushAudio(p);
+            for (int i = 0; i < 5; i++) tx.PushAudio(pcm[i]);   // partial superframe at the end, dropped
+            uint stream = tx.StreamId;
+            tx.Stop();
+
+            Check(clear.Tdus.Count == 5 && clear.Tdus[0].Grant && clear.Tdus.Skip(1).All(t => !t.Grant) &&
+                  clear.Tdus.All(t => t.Src == rid && t.Dst == tg && t.Stream == stream && stream != 0),
+                  "call framing: one grant demand, then four end TDUs, all on the call's stream ID");
+            Check(clear.Voice.Count == frames / 9 && clear.Voice.All(v => v.Stream == stream) &&
+                  clear.Voice.Select(v => (int)v.Seq).SequenceEqual(Enumerable.Range(0, frames / 9)),
+                  $"{frames / 9} LDUs sent with RTP sequence 0..{frames / 9 - 1}; partial superframe dropped");
+
+            byte[] l1 = clear.Voice[0].Frame;
+            int lcRecord = P25VoiceReceiver.PayloadOffset + P25VoiceReceiver.RecordOffsets[2];
+            int tgRecord = P25VoiceReceiver.PayloadOffset + P25VoiceReceiver.RecordOffsets[3];
+            int srcRecord = P25VoiceReceiver.PayloadOffset + P25VoiceReceiver.RecordOffsets[4];
+            Check(l1[22] == (byte)P25DUID.LDU1 && clear.Voice[1].Frame[22] == (byte)P25DUID.LDU2 && l1[23] == 178 && l1.Length == P25FrameBuilder.FrameSize,
+                  "LDU1/LDU2 headers carry the DUID and payload length");
+            Check(l1[lcRecord + 1] == P25Defines.LC_GROUP && l1[lcRecord + 3] == 0x04 &&
+                  ((l1[tgRecord + 1] << 16) | (l1[tgRecord + 2] << 8) | l1[tgRecord + 3]) == tg &&
+                  ((l1[srcRecord + 1] << 16) | (l1[srcRecord + 2] << 8) | l1[srcRecord + 3]) == rid,
+                  "link control: group call, priority 4, talkgroup and source in the voice records");
+            Check(l1[P25VoiceReceiver.HduFlagOffset] == P25Defines.P25_FT_HDU_VALID && l1[P25VoiceReceiver.HduAlgOffset] == P25Defines.P25_ALGO_UNENCRYPT,
+                  "clear call marked clear in the HDU parameters");
+
+            List<byte[]> fed = RoundTrip(clear, tg, rid, new KeyStore(), out long muted);
+            Check(muted == 0 && SameCodewords(fed, expected), "clear transmit decodes back to exactly the encoded codewords");
+
+            // encrypted call (AES-256)
+            KeyStore keys = new KeyStore();
+            keys.Store(P25Defines.P25_ALGO_AES, TestKeyId, TestKey);
+            CaptureSink secure = new CaptureSink(headerPeer);
+            P25Transmitter stx = new P25Transmitter(secure, keys, rid, secureTg, P25Defines.P25_ALGO_AES, TestKeyId);
+            Check(stx.Start(out string err2) && err2 == null && stx.Encrypted, "AES transmit starts with the key held");
+            foreach (short[] p in pcm) stx.PushAudio(p);
+            stx.Stop();
+
+            byte[] s1 = secure.Voice[0].Frame;
+            Check(s1[P25VoiceReceiver.HduFlagOffset] == P25Defines.P25_FT_HDU_VALID && s1[P25VoiceReceiver.HduAlgOffset] == P25Defines.P25_ALGO_AES &&
+                  ((s1[P25VoiceReceiver.HduKeyIdOffset] << 8) | s1[P25VoiceReceiver.HduKeyIdOffset + 1]) == TestKeyId &&
+                  s1.Skip(P25VoiceReceiver.HduMiOffset).Take(P25Defines.P25_MI_LENGTH).Any(b => b != 0) &&
+                  s1[lcRecord + 3] == 0x44,
+                  "AES call: HDU carries algorithm, key ID and a random MI; service options marked protected");
+            Check(P25VoiceReceiver.TryExtractCodewords(s1, P25VoiceReceiver.Ldu1FirstRecord, out byte[][] wire) && !wire[0].SequenceEqual(expected[0]),
+                  "AES call is encrypted on the wire");
+
+            List<byte[]> secureFed = RoundTrip(secure, secureTg, rid, keys, out long secureMuted);
+            Check(secureMuted == 0 && SameCodewords(secureFed, expected), "AES transmit decrypts back to exactly the encoded codewords");
+
+            // refusals
+            CaptureSink none = new CaptureSink(headerPeer);
+            P25Transmitter nokey = new P25Transmitter(none, new KeyStore(), rid, secureTg, P25Defines.P25_ALGO_AES, TestKeyId);
+            Check(!nokey.Start(out string err3) && err3.Contains("not transmitting in the clear") && none.Tdus.Count == 0,
+                  "secure channel without its key refuses to transmit (nothing sent)");
+            P25Transmitter norid = new P25Transmitter(none, new KeyStore(), 0, tg, P25Defines.P25_ALGO_UNENCRYPT, 0);
+            Check(!norid.Start(out _) && none.Tdus.Count == 0, "transmit without a console RID is refused");
+        }
+
+        /// <summary>
+        /// Plays captured transmit frames into a receiver and returns the codewords it would decode.
+        /// </summary>
+        private static List<byte[]> RoundTrip(CaptureSink sent, uint tg, uint src, KeyStore keys, out long muted)
+        {
+            List<byte[]> fed = new List<byte[]>();
+            using P25VoiceReceiver rx = new P25VoiceReceiver(tg, keys);
+            rx.Codeword += fed.Add;
+            foreach (var (frame, _, stream) in sent.Voice)
+                rx.Handle(tg, src, (P25DUID)frame[22], stream, frame);
+            rx.Handle(tg, src, P25DUID.TDU, sent.Voice[0].Stream, new byte[24]);
+            muted = rx.FramesMuted;
+            return fed;
         }
 
         private static bool SameCodewords(List<byte[]> got, List<byte[]> expected) =>

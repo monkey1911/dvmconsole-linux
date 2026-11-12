@@ -38,6 +38,7 @@ namespace dvmcli
                 {
                     "list" => List(opt),
                     "listen" => Listen(opt),
+                    "tui" => RunTui(opt),
                     "selftest" => SelfTest.Run(),
                     _ => Usage($"unknown command '{args[0]}'")
                 };
@@ -66,6 +67,7 @@ namespace dvmcli
             Console.WriteLine("  dvmcli list     --codeplug FILE");
             Console.WriteLine("  dvmcli listen   --codeplug FILE (--channel NAME | --tg TGID) [--system NAME]");
             Console.WriteLine("                  [--wav FILE] [--no-play] [--player CMD] [--verbose]");
+            Console.WriteLine("  dvmcli tui      --codeplug FILE [--system NAME] [--tx-limit SECONDS] [--log FILE]");
             Console.WriteLine("  dvmcli selftest");
             Console.WriteLine();
             Console.WriteLine("listen follows one P25 talkgroup and plays clear calls through PipeWire (pw-play).");
@@ -197,8 +199,9 @@ namespace dvmcli
                         sink.Write(samples);
                 };
 
-                CliPeer peer = new CliPeer(system, receiver, keys, opt.Verbose);
+                CliPeer peer = new CliPeer(system, keys, opt.Verbose);
                 peer.Status += Say;
+                peer.P25Frame += e => receiver.Handle(e.DstId, e.SrcId, e.DUID, e.StreamId, e.Data);
 
                 // a call using a key we don't hold yet asks the FNE for it
                 receiver.KeyNeeded += (alg, kid) => peer.RequestKey(alg, kid);
@@ -234,6 +237,23 @@ namespace dvmcli
             }
         }
 
+        private static int RunTui(Options opt)
+        {
+            Codeplug cp = LoadCodeplug(opt.Codeplug);
+            Codeplug.System system = opt.SystemName == null
+                ? cp.Systems[0]
+                : cp.Systems.FirstOrDefault(s => string.Equals(s.Name, opt.SystemName, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new ArgumentException($"no system named '{opt.SystemName}'");
+
+            if (PipeWireSink.FindPlayer() == null)
+                Console.Error.WriteLine("warning: pw-play not found; you'll see activity but hear nothing");
+            if (PipeWireCapture.FindRecorder() == null)
+                Console.Error.WriteLine("warning: pw-record not found; transmit won't work");
+
+            string logFile = string.IsNullOrWhiteSpace(opt.LogFile) ? null : Path.GetFullPath(opt.LogFile);
+            return new Tui(cp, system, TimeSpan.FromSeconds(opt.TxLimitSeconds), logFile).Run();
+        }
+
         /// <summary>
         /// Applies a linear gain with clipping.
         /// </summary>
@@ -258,9 +278,10 @@ namespace dvmcli
         /// </summary>
         private sealed class Options
         {
-            public string Codeplug, Channel, Tg, SystemName, Wav, Player;
+            public string Codeplug, Channel, Tg, SystemName, Wav, Player, LogFile;
             public bool NoPlay, Verbose;
             public double Gain = 1.0;
+            public int TxLimitSeconds = 120;
 
             public static Options Parse(string[] args)
             {
@@ -282,6 +303,11 @@ namespace dvmcli
                             break;
                         case "--no-play": o.NoPlay = true; break;
                         case "--verbose": case "-v": o.Verbose = true; break;
+                        case "--log": o.LogFile = Next(); break;
+                        case "--tx-limit":
+                            if (!int.TryParse(Next(), out o.TxLimitSeconds) || o.TxLimitSeconds < 5 || o.TxLimitSeconds > 900)
+                                throw new ArgumentException("--tx-limit must be between 5 and 900 seconds");
+                            break;
                         default: throw new ArgumentException($"unknown option '{args[i]}'");
                     }
                 }
