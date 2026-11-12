@@ -27,11 +27,14 @@
     <Compile Include="$(DvmConsoleSrc)VocoderInterop.cs" Link="dvmconsole\VocoderInterop.cs" />
     <Compile Include="$(DvmConsoleSrc)VocoderToneLookupTable.cs" Link="dvmconsole\VocoderToneLookupTable.cs" />
     <Compile Include="$(DvmConsoleSrc)Log.cs" Link="dvmconsole\Log.cs" />
+    <Compile Include="$(DvmConsoleSrc)AliasTools.cs" Link="dvmconsole\AliasTools.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\extern\dvmconsole\fnecore\fnecore.csproj" />
     <PackageReference Include="YamlDotNet" Version="16.2.0" />
+    <!-- only needed for a [JsonIgnore] attribute in Codeplug.cs; same version as dvmconsole -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 
   <!-- libvocoder.so built by CMake (see build.sh / CI) is copied next to dvmcli when present -->
