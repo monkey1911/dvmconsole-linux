@@ -40,6 +40,7 @@ namespace dvmcli
 
         private MBEEncoder encoder;
         private P25Crypto crypto;
+        private byte[] txKey;     // P25Crypto keeps a reference to this array; wiped when the call ends
         private byte[] mi;
         private int n;
         private bool firstPacket;
@@ -118,12 +119,16 @@ namespace dvmcli
                     mi = new byte[P25Defines.P25_MI_LENGTH];
                     do { RandomNumberGenerator.Fill(mi); } while (mi.All(b => b == 0));
 
+                    // P25Crypto stores a reference to the key (it does not copy it) and regenerates the
+                    // keystream from it on every Prepare, so the copy must stay intact until the call ends
+                    txKey = key;
                     crypto = new P25Crypto();
-                    crypto.SetKey(KeyId, AlgorithmId, key);
-                    CryptographicOperations.ZeroMemory(key);
+                    crypto.SetKey(KeyId, AlgorithmId, txKey);
                     if (!crypto.Prepare(AlgorithmId, KeyId, mi))
                     {
                         crypto = null;
+                        CryptographicOperations.ZeroMemory(txKey);
+                        txKey = null;
                         error = $"could not use the {KeyStore.AlgorithmName(AlgorithmId)} key 0x{KeyId:X4}";
                         return false;
                     }
@@ -202,6 +207,11 @@ namespace dvmcli
 
                 crypto?.Reset();
                 crypto = null;
+                if (txKey != null)
+                {
+                    CryptographicOperations.ZeroMemory(txKey);
+                    txKey = null;
+                }
                 if (mi != null)
                     CryptographicOperations.ZeroMemory(mi);
                 encoder = null;
