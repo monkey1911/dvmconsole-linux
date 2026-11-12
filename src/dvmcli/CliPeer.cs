@@ -24,6 +24,7 @@ namespace dvmcli
         private readonly P25VoiceReceiver receiver;
         private readonly KeyStore keys;
         private readonly bool verbose;
+        private readonly uint consoleRid;
         private readonly object keyLock = new object();
         private readonly List<(byte alg, ushort kid)> pendingKeyRequests = new List<(byte, ushort)>();
 
@@ -42,6 +43,9 @@ namespace dvmcli
             this.receiver = receiver;
             this.keys = keys;
             this.verbose = verbose;
+
+            // key requests identify the requesting radio; the console uses its configured RID
+            uint.TryParse(system.Rid, out consoleRid);
 
             fne.Logger = (LogLevel level, string message) =>
             {
@@ -160,10 +164,16 @@ namespace dvmcli
                 return;
             }
 
+            if (consoleRid == 0)
+            {
+                Status?.Invoke($"cannot request key 0x{keyId:X4}: the system has no valid 'rid' in the codeplug (the FNE needs it to answer)");
+                return;
+            }
+
             try
             {
-                fne.SendMasterKeyRequest(algId, keyId);
-                Status?.Invoke($"requested {KeyStore.AlgorithmName(algId)} key 0x{keyId:X4} from the FNE");
+                fne.SendMasterKeyRequest(algId, keyId, consoleRid);
+                Status?.Invoke($"requested {KeyStore.AlgorithmName(algId)} key 0x{keyId:X4} from the FNE (as RID {consoleRid})");
             }
             catch (Exception ex)
             {
