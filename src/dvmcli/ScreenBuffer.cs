@@ -141,27 +141,31 @@ namespace dvmcli
                     Set(x, y, " ", style);
         }
 
-        /// <summary>Draws a rounded box border.</summary>
-        public void Box(Rect r, Style style)
+        /// <summary>Draws a box border: rounded and thin, or heavy.</summary>
+        public void Box(Rect r, Style style, bool heavy = false)
         {
             if (r.W < 2 || r.H < 2)
                 return;
+            string h = heavy ? "━" : "─", v = heavy ? "┃" : "│";
             int right = r.X + r.W - 1, bottom = r.Y + r.H - 1;
             for (int x = r.X + 1; x < right; x++)
             {
-                Set(x, r.Y, "─", style);
-                Set(x, bottom, "─", style);
+                Set(x, r.Y, h, style);
+                Set(x, bottom, h, style);
             }
             for (int y = r.Y + 1; y < bottom; y++)
             {
-                Set(r.X, y, "│", style);
-                Set(right, y, "│", style);
+                Set(r.X, y, v, style);
+                Set(right, y, v, style);
             }
-            Set(r.X, r.Y, "╭", style);
-            Set(right, r.Y, "╮", style);
-            Set(r.X, bottom, "╰", style);
-            Set(right, bottom, "╯", style);
+            Set(r.X, r.Y, heavy ? "┏" : "╭", style);
+            Set(right, r.Y, heavy ? "┓" : "╮", style);
+            Set(r.X, bottom, heavy ? "┗" : "╰", style);
+            Set(right, bottom, heavy ? "┛" : "╯", style);
         }
+
+        /// <summary>The horizontal line character a box of this weight uses (for title decorations).</summary>
+        public static string BoxLine(bool heavy) => heavy ? "━" : "─";
 
         /// <summary>
         /// Registers a clickable region; when regions overlap, the one added last wins.

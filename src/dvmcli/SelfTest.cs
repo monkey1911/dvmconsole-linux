@@ -236,7 +236,7 @@ namespace dvmcli
 
             // grid geometry
             Tui.GridGeometry g = Tui.Layout(120, 40, 10);
-            Check(g.Columns == 4 && g.CardWidth == 30 && g.TotalRows == 3 && g.LogHeight >= 6, $"TUI grid: 4 cards across at 120 columns ({g.VisibleRows} rows visible, log {g.LogHeight})");
+            Check(g.Columns == 4 && g.CardWidth == 30 && g.TotalRows == 3 && g.LogHeight >= 6 && g.LogHeight <= 10, $"TUI grid: 4 cards across at 120 columns ({g.VisibleRows} rows visible, log {g.LogHeight})");
             Check(Tui.Layout(60, 40, 10).Columns == 2 && Tui.Layout(300, 40, 10).Columns == 4, "TUI grid: fewer columns on narrow terminals, never more than 4");
 
             // clicks on a rendered frame
@@ -245,6 +245,11 @@ namespace dvmcli
             Check(frame.RowText(1).Contains("PTT") && frame.RowText(1).Contains("MUTE") && frame.RowText(1).Contains("EXIT"), "TUI title bar has PTT, MUTE and EXIT buttons");
             Check(frame.RowText(Tui.TitleHeight).Contains("Calling") && frame.RowText(Tui.TitleHeight).Contains("Secure"), "TUI cards for both channels drawn side by side");
             Check(frame.RowText(Tui.TitleHeight + 1).Contains("🔒"), "TUI secure card shows the lock");
+            Check(frame.RowText(Tui.TitleHeight).StartsWith("┏") && frame.RowText(Tui.TitleHeight).Contains("▶ Calling") &&
+                  frame.RowText(Tui.TitleHeight).Substring(30).TrimStart().StartsWith("╭"), "TUI focused card has a heavy border; others are thin");
+            Tui.GridGeometry bottom = Tui.Layout(120, 60, 2);
+            Check(bottom.LogHeight <= 10 && bottom.LogTop + bottom.LogHeight == 60 - Tui.FooterHeight, "TUI log is capped and sits just above the footer");
+            Check(Enumerable.Range(0, 40).Any(y => frame.RowText(y).Contains("Recent calls")), "TUI recent-calls panel drawn beside the log");
 
             tui.HandleInput(new InputEvent(InputKind.Click, X: 30 + 5, Y: Tui.TitleHeight + 3));    // body of card 2
             Check(tui.Cursor == 1 && tui.IsSelected(1) && !tui.IsSelected(0), "TUI click on a card focuses it and starts listening");

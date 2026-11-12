@@ -51,7 +51,10 @@ namespace dvmcli
         public const int MinCardWidth = 24;
         public const int MaxColumns = 4;
         private const int MinLogHeight = 6;
+        private const int MaxBottomHeight = 10;   // log + recent calls: 8 lines plus the border
         private const int MaxLogLines = 500;
+        private const int MaxRecentCalls = 100;
+        private const int MinSplitWidth = 100;    // below this the recent-calls panel is hidden
 
         private readonly Codeplug.System system;
         private readonly TimeSpan txLimit;
@@ -60,6 +63,7 @@ namespace dvmcli
         private readonly List<Chan> chans = new List<Chan>();
         private readonly object uiLock = new object();
         private readonly LinkedList<string> log = new LinkedList<string>();
+        private readonly LinkedList<(string Time, string Chan, string Who, string Detail, bool Tx)> recent = new();
         private readonly ScreenBuffer screen = new ScreenBuffer();
 
         private CliPeer peer;
@@ -197,6 +201,7 @@ namespace dvmcli
                         {
                             c.Active = false;
                             c.LastCall = $"{c.ActiveSrc} at {DateTime.Now:HH:mm}";
+                            AddRecent(c.Cfg.Name, c.ActiveSrc.ToString(), "not listening", tx: false);
                         }
                     }
                     else if (e.DUID == P25DUID.LDU1 || e.DUID == P25DUID.LDU2 || e.DUID == P25DUID.HDU)
@@ -231,6 +236,7 @@ namespace dvmcli
             {
                 c.LastCall = $"{src} at {DateTime.Now:HH:mm} ({secs:F0} s)";
                 AddLog($"{c.Cfg.Name}: end {src}, {secs:F1} s, {crypt}{(muted > 0 ? $", {muted} frames muted" : string.Empty)}");
+                AddRecent(c.Cfg.Name, src.ToString(), $"{secs:F0} s, {crypt}{(muted > 0 ? ", partly muted" : string.Empty)}", tx: false);
             };
             rx.Audio += samples =>
             {
@@ -384,7 +390,10 @@ namespace dvmcli
             bool was = t.IsTransmitting;
             t.Stop();
             if (was)
+            {
                 AddLog($"{txChan?.Cfg.Name}: TX end, {secs:F1} s, {t.FramesSent} frames{(reason != null ? $" ({reason})" : string.Empty)}");
+                AddRecent(txChan?.Cfg.Name, $"{t.SourceId}", $"{secs:F0} s, {(t.Encrypted ? KeyStore.AlgorithmName(t.AlgorithmId) : "clear")}", tx: true);
+            }
 
             tx = null;
             txChan = null;
@@ -485,7 +494,7 @@ namespace dvmcli
 
         /// <summary>
         /// Works out the card grid for a terminal size: up to four cards across, at least <see cref="MinCardWidth"/>
-        /// wide, and as many card rows as fit while leaving room for the log.
+        /// wide, and as many card rows as fit while leaving room for the log (capped at <see cref="MaxBottomHeight"/> rows).
         /// </summary>
         public static GridGeometry Layout(int width, int height, int cardCount)
         {
@@ -495,10 +504,11 @@ namespace dvmcli
             int avail = Math.Max(0, height - TitleHeight - FooterHeight);
             int visible = Math.Clamp((avail - MinLogHeight) / CardHeight, 1, Math.Max(1, totalRows));
             int gridH = Math.Min(visible * CardHeight, avail);
-            int logH = avail - gridH;
+            int logH = Math.Min(avail - gridH, MaxBottomHeight);
             if (logH < 3)
                 logH = 0;
-            return new GridGeometry(cols, cardW, visible, totalRows, TitleHeight, TitleHeight + gridH, logH);
+            // the log sits just above the footer; any spare rows stay between it and the cards
+            return new GridGeometry(cols, cardW, visible, totalRows, TitleHeight, TitleHeight + avail - logH, logH);
         }
 
         /// <summary>
@@ -543,7 +553,16 @@ namespace dvmcli
             }
 
             if (g.LogHeight > 0)
-                DrawLog(new Rect(0, g.LogTop, width, g.LogHeight));
+            {
+                if (width >= MinSplitWidth)
+                {
+                    int callsW = Math.Min(width / 2, 64);
+                    DrawRecent(new Rect(0, g.LogTop, callsW, g.LogHeight));
+                    DrawLog(new Rect(callsW, g.LogTop, width - callsW, g.LogHeight));
+                }
+                else
+                    DrawLog(new Rect(0, g.LogTop, width, g.LogHeight));
+            }
             DrawFooter(width, height);
             return screen;
         }
@@ -556,12 +575,12 @@ namespace dvmcli
 
             bool txOn = Transmitting;
             Button(new Rect(x, 0, pttW, TitleHeight), txOn ? "● TX" : "PTT",
-                   txOn ? Style.Of(Ansi.BrightWhite, Ansi.Red, bold: true) : Style.Of(Ansi.BrightWhite, Ansi.Blue, bold: true), ToggleTx);
+                   txOn ? Style.Of(Ansi.Black, Ansi.BrightRed, bold: true) : Style.Of(Ansi.Black, Ansi.BrightBlue, bold: true), ToggleTx);
             x += pttW + 1;
             Button(new Rect(x, 0, muteW, TitleHeight), globalMute ? "MUTED" : "MUTE",
-                   globalMute ? Style.Of(Ansi.Black, Ansi.Yellow, bold: true) : Style.Of(Ansi.BrightWhite, Ansi.Grey, bold: true), ToggleGlobalMute);
+                   globalMute ? Style.Of(Ansi.Black, Ansi.BrightYellow, bold: true) : Style.Of(Ansi.Black, Ansi.White, bold: true), ToggleGlobalMute);
             x += muteW + 1;
-            Button(new Rect(x, 0, exitW, TitleHeight), "EXIT", Style.Of(Ansi.BrightWhite, Ansi.Magenta, bold: true), () => quit = true);
+            Button(new Rect(x, 0, exitW, TitleHeight), "EXIT", Style.Of(Ansi.Black, Ansi.BrightMagenta, bold: true), () => quit = true);
 
             // system box
             int boxW = width - (pttW + muteW + exitW + 3);
@@ -595,7 +614,7 @@ namespace dvmcli
 
             Style border = txHere ? Style.Of(Ansi.BrightRed, bold: true)
                 : rxHere ? Style.Of(Ansi.BrightGreen, bold: true)
-                : focused ? Style.Of(Ansi.BrightWhite, bold: true)
+                : focused ? Style.Of(Ansi.BrightCyan, bold: true)
                 : c.Selected ? Style.Of(Ansi.Green)
                 : Style.Of(Ansi.Grey);
             Style dim = Style.Of(Ansi.Grey);
@@ -608,15 +627,15 @@ namespace dvmcli
             });
 
             Rect box = new Rect(r.X, r.Y, r.W - 1, r.H);    // one column gap between cards
-            screen.Box(box, border);
+            screen.Box(box, border, heavy: focused);
             int ix = box.X + 2, iw = box.W - 4, right = box.X + box.W - 2;
 
             // title and listen toggle
             string toggle = c.Selected ? "[●]" : "[ ]";
             int toggleX = right - 3;
-            screen.Text(box.X + 1, box.Y, focused ? "▶" : "─", border);
-            Style nameStyle = !c.IsP25 ? dim : focused || c.Selected ? Style.Of(Ansi.BrightWhite, bold: true) : Style.Of(Ansi.White);
-            screen.Text(ix, box.Y, $" {c.Cfg.Name} ", nameStyle, toggleX - ix - 1);
+            Style nameStyle = !c.IsP25 ? dim : focused ? Style.Of(Ansi.Black, Ansi.BrightCyan, bold: true)
+                : c.Selected ? Style.Of(Ansi.BrightWhite, bold: true) : Style.Of(Ansi.White);
+            screen.Text(ix, box.Y, focused ? $" ▶ {c.Cfg.Name} " : $" {c.Cfg.Name} ", nameStyle, toggleX - ix - 1);
             screen.Text(toggleX, box.Y, toggle, c.Selected ? Style.Of(Ansi.BrightGreen, bold: true) : dim);
             screen.OnClick(new Rect(toggleX - 1, box.Y, 5, 1), () =>
             {
@@ -702,6 +721,40 @@ namespace dvmcli
                 screen.Text(x, y, c.Muted || globalMute ? "listening (muted)" : "listening", c.Muted || globalMute ? Style.Of(Ansi.Yellow) : Style.Of(Ansi.Green), w);
             else
                 screen.Text(x, y, "click to listen", Style.Of(Ansi.Grey), w);
+        }
+
+        private void DrawRecent(Rect r)
+        {
+            screen.Box(r, Style.Of(Ansi.Grey));
+            screen.Text(r.X + 2, r.Y, " Recent calls ", Style.Of(Ansi.White, bold: true));
+
+            List<(string Time, string Chan, string Who, string Detail, bool Tx)> rows;
+            lock (uiLock)
+                rows = recent.Take(r.H - 2).ToList();    // newest first
+            if (rows.Count == 0)
+                screen.Text(r.X + 2, r.Y + 1, "none yet", Style.Of(Ansi.Grey), r.W - 4);
+
+            int x = r.X + 2, w = r.W - 4;
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var call = rows[i];
+                int y = r.Y + 1 + i, used = 0;
+                used += screen.Text(x, y, $"{call.Time} ", Style.Of(Ansi.Grey), w);
+                used += screen.Text(x + used, y, call.Tx ? "TX " : "RX ", call.Tx ? Style.Of(Ansi.BrightRed, bold: true) : Style.Of(Ansi.BrightGreen, bold: true), w - used);
+                used += screen.Text(x + used, y, $"{call.Chan,-10} ", Style.Of(Ansi.BrightWhite), w - used);
+                used += screen.Text(x + used, y, $"{call.Who,-8} ", Style.Plain, w - used);
+                screen.Text(x + used, y, call.Detail, Style.Of(Ansi.Grey), w - used);
+            }
+        }
+
+        private void AddRecent(string chan, string who, string detail, bool tx)
+        {
+            lock (uiLock)
+            {
+                recent.AddFirst(($"{DateTime.Now:HH:mm}", chan ?? "?", who, detail, tx));
+                while (recent.Count > MaxRecentCalls)
+                    recent.RemoveLast();
+            }
         }
 
         private void DrawLog(Rect r)
