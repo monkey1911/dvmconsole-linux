@@ -1,0 +1,7 @@
+[submodule "extern/dvmconsole"]
+	path = extern/dvmconsole
+	url = https://github.com/monkey1911/dvmconsole-ARM64.git
+	branch = dev
+[submodule "extern/dvmvocoder"]
+	path = extern/dvmvocoder
+	url = https://github.com/DVMProject/dvmvocoder.git
