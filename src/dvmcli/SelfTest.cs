@@ -26,7 +26,12 @@ namespace dvmcli
         {
             Console.WriteLine($"{(ok ? "PASS" : "FAIL")}: {what}");
             if (!ok)
+            {
                 failures++;
+                // surfaces as an annotation on the GitHub Actions run
+                if (Environment.GetEnvironmentVariable("GITHUB_ACTIONS") == "true")
+                    Console.WriteLine($"::error title=selftest::FAIL: {what}");
+            }
         }
 
         public static int Run()
