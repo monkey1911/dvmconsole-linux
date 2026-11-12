@@ -4,7 +4,7 @@ A headless test of the [DVM Desktop Dispatch Console](https://github.com/DVMProj
 
 It exists to prove the networking, vocoder and audio work on Linux ARM64 before any decision about a full desktop port.
 
-**What works:** FNE login using your dvmconsole codeplug, P25 receive and transmit (clear, AES-256, DES, ADP/ARC4 with keys from the FNE), PipeWire audio, a terminal console with toggle push-to-talk, and WAV recording.
+**What works:** FNE login using your dvmconsole codeplug, P25 receive and transmit (clear, AES-256, DES, ADP/ARC4 with keys from the FNE), PipeWire audio, a terminal console (channel cards, mouse support, toggle push-to-talk), and WAV recording.
 
 **Not yet:** DMR/NXDN/analog, and a graphical UI.
 
@@ -72,16 +72,28 @@ Start the terminal console for the codeplug's first system (or pick one with `--
 ./dvmcli tui --codeplug ~/dvm/codeplug-linux.yml
 ```
 
+Channels are shown as cards, up to four across. The mouse works in any terminal with xterm mouse reporting (Alacritty, Ghostty, Kitty, foot and most others):
+
+| Click | Action |
+|---|---|
+| **PTT** (title bar) | Toggle transmit on the focused card (click again to stop) |
+| **MUTE** (title bar) | Mute or unmute all receive audio |
+| **EXIT** (title bar) | Quit |
+| A card | Focus it and start listening |
+| `[●]` on a card | Stop listening |
+| `[-]` `[+]` `[mute]` on a card | That card's volume and mute |
+| Wheel | Scroll the cards, or the log when the pointer is over it |
+
 | Key | Action |
 |---|---|
-| ↑ / ↓, PgUp / PgDn, Home / End | Move between channels |
-| Enter | Select (listen to) or deselect the highlighted channel |
-| Space | Toggle transmit on the highlighted channel (press again to stop) |
+| Arrows, Tab, PgUp / PgDn, Home / End | Move between cards |
+| Enter | Start or stop listening on the focused card |
+| Space | Toggle transmit on the focused card (press again to stop) |
 | Esc | Stop transmitting |
-| m | Mute or unmute the highlighted channel |
-| + / - | Volume of the highlighted channel |
-| k | Request the highlighted channel's key from the FNE again |
-| q | Quit |
+| m / M | Mute the focused card / mute everything |
+| + / - | Volume of the focused card |
+| k | Request the focused card's key from the FNE again |
+| q or Ctrl+C | Quit |
 
 Transmit uses the default PipeWire microphone and the system's `rid` as the source ID. A secure channel never transmits in the clear: without its key, transmit is refused. Transmissions stop automatically after 120 seconds; change that with `--tx-limit SECONDS`. Add `--log FILE` to keep a copy of the log.
 

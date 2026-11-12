@@ -41,7 +41,7 @@ namespace dvmcli
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
-                RedirectStandardInput = false
+                RedirectStandardInput = true     // keep the child off the terminal
             };
             if (Path.GetFileName(Command) == "pw-cat")
                 psi.ArgumentList.Add("--record");

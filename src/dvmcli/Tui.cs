@@ -2,15 +2,14 @@
 /**
 * dvmcli - headless Linux proof of concept for the DVM Desktop Dispatch Console.
 *
-* Terminal UI: one system, its P25 channels, live receive on selected channels,
-* and Space-bar toggle push-to-talk on the highlighted channel.
+* Terminal UI: one system's channels as a grid of cards (up to four across), live
+* receive on selected channels, toggle push-to-talk, and mouse support: PTT, MUTE
+* and EXIT buttons in the title bar, click a card to listen, wheel to scroll.
 */
 
 using dvmconsole;
 using fnecore;
 using fnecore.P25;
-using Spectre.Console;
-using Spectre.Console.Rendering;
 
 namespace dvmcli
 {
@@ -43,7 +42,17 @@ namespace dvmcli
             public string LastCall = string.Empty;
         }
 
-        private readonly Codeplug codeplug;
+        /// <summary>Grid geometry for a terminal size.</summary>
+        public readonly record struct GridGeometry(int Columns, int CardWidth, int VisibleRows, int TotalRows, int GridTop, int LogTop, int LogHeight);
+
+        public const int TitleHeight = 3;
+        public const int FooterHeight = 2;
+        public const int CardHeight = 7;
+        public const int MinCardWidth = 24;
+        public const int MaxColumns = 4;
+        private const int MinLogHeight = 6;
+        private const int MaxLogLines = 500;
+
         private readonly Codeplug.System system;
         private readonly TimeSpan txLimit;
         private readonly string logFile;
@@ -51,23 +60,41 @@ namespace dvmcli
         private readonly List<Chan> chans = new List<Chan>();
         private readonly object uiLock = new object();
         private readonly LinkedList<string> log = new LinkedList<string>();
-        private const int MaxLogLines = 500;
+        private readonly ScreenBuffer screen = new ScreenBuffer();
 
         private CliPeer peer;
         private int cursor;
+        private int scrollRow;
+        private int logOffset;
+        private bool followCursor = true;
         private volatile bool quit;
+        private volatile bool globalMute;
 
         private P25Transmitter tx;
         private Chan txChan;
         private PipeWireCapture capture;
         private volatile string pendingTxStop;
 
+        /// <summary>Self-test hook: don't start audio players when selecting channels.</summary>
+        internal bool NoAudio { get; set; }
+
+        /// <summary>Index of the focused card (self-test hook).</summary>
+        internal int Cursor => cursor;
+
+        /// <summary>Whether channel <paramref name="i"/> is selected (self-test hook).</summary>
+        internal bool IsSelected(int i) => chans[i].Selected;
+
+        /// <summary>Global mute (self-test hook).</summary>
+        internal bool GlobalMute => globalMute;
+
+        /// <summary>Set when the user asks to quit (self-test hook).</summary>
+        internal bool QuitRequested => quit;
+
         /// <summary>
         /// Initializes a new instance of the <see cref="Tui"/> class.
         /// </summary>
         public Tui(Codeplug codeplug, Codeplug.System system, TimeSpan txLimit, string logFile)
         {
-            this.codeplug = codeplug;
             this.system = system;
             this.txLimit = txLimit;
             this.logFile = logFile;
@@ -103,43 +130,34 @@ namespace dvmcli
         /// </summary>
         public int Run()
         {
+            if (!Terminal.IsTerminal())
+                throw new InvalidOperationException("the TUI needs an interactive terminal (use 'listen' for scripts)");
+
             peer = new CliPeer(system, keys, verbose: false);
             peer.Status += AddLog;
             peer.P25Frame += OnFrame;
-            keys.KeyAdded += (_, _) => { };   // key column re-reads the store on each render
 
-            Console.CancelKeyPress += (s, e) => { e.Cancel = true; quit = true; };
             AddLog($"connecting to {system.Name} ({system.Address}:{system.Port}) as peer {system.PeerId}");
             peer.Start();
 
-            Layout layout = new Layout("root").SplitRows(
-                new Layout("header").Size(3),
-                new Layout("main").SplitColumns(
-                    new Layout("channels").Ratio(3),
-                    new Layout("log").Ratio(2)),
-                new Layout("footer").Size(4));
-
+            Terminal term = new Terminal();
             try
             {
-                AnsiConsole.Live(layout)
-                    .AutoClear(true)
-                    .Overflow(VerticalOverflow.Crop)
-                    .Start(ctx =>
-                    {
-                        while (!quit)
-                        {
-                            while (Console.KeyAvailable)
-                                HandleKey(Console.ReadKey(intercept: true));
+                while (!quit)
+                {
+                    while (term.TryRead(out InputEvent e))
+                        HandleInput(e);
 
-                            Housekeeping();
-                            Render(layout);
-                            ctx.Refresh();
-                            Thread.Sleep(80);
-                        }
-                    });
+                    Housekeeping();
+                    (int w, int h) = term.Size;
+                    Render(w, h);
+                    term.Write(screen.Flush());
+                    Thread.Sleep(50);
+                }
             }
             finally
             {
+                term.Dispose();
                 StopTx("console closed");
                 foreach (Chan c in chans)
                     Deselect(c, quiet: true);
@@ -207,7 +225,7 @@ namespace dvmcli
 
             P25VoiceReceiver rx = new P25VoiceReceiver(c.Tg, keys);
             rx.Status += s => { if (!s.StartsWith("CALL ")) AddLog($"{c.Cfg.Name}: {s}"); };
-            rx.KeyNeeded += (alg, kid) => peer.RequestKey(alg, kid);
+            rx.KeyNeeded += (alg, kid) => peer?.RequestKey(alg, kid);
             rx.CallStarted += src => AddLog($"{c.Cfg.Name}: RX {src}");
             rx.CallEnded += (src, secs, played, muted, crypt) =>
             {
@@ -217,28 +235,33 @@ namespace dvmcli
             rx.Audio += samples =>
             {
                 PipeWireSink sink = c.Sink;
-                if (sink == null || c.Muted || (txChan == c && tx?.IsTransmitting == true))
+                if (sink == null || c.Muted || globalMute || (txChan == c && tx?.IsTransmitting == true))
                     return;
                 Program.ApplyGain(samples, c.Gain);
                 sink.Write(samples);
             };
 
-            try
+            if (!NoAudio)
             {
-                c.Sink = new PipeWireSink();
-            }
-            catch (Exception ex)
-            {
-                AddLog($"{c.Cfg.Name}: no audio output ({ex.Message})");
+                try
+                {
+                    PipeWireSink sink = new PipeWireSink();
+                    sink.Failed += msg => AddLog($"{c.Cfg.Name}: {msg}");
+                    c.Sink = sink;
+                }
+                catch (Exception ex)
+                {
+                    AddLog($"{c.Cfg.Name}: no audio output ({ex.Message})");
+                }
             }
 
             c.Rx = rx;
             c.Active = false;
             c.Selected = true;
-            AddLog($"{c.Cfg.Name}: selected (tg {c.Tg})");
+            AddLog($"{c.Cfg.Name}: listening (tg {c.Tg})");
 
             if (c.Encrypted && KeyStore.IsSupported(c.KeyRequestAlg) && !keys.TryGet(c.KeyRequestAlg, c.KeyId, out _))
-                peer.RequestKey(c.KeyRequestAlg, c.KeyId);
+                peer?.RequestKey(c.KeyRequestAlg, c.KeyId);
         }
 
         private void Deselect(Chan c, bool quiet = false)
@@ -256,7 +279,36 @@ namespace dvmcli
             rx?.Dispose();
             sink?.Dispose();
             if (!quiet)
-                AddLog($"{c.Cfg.Name}: deselected");
+                AddLog($"{c.Cfg.Name}: stopped listening");
+        }
+
+        private void ToggleSelect(Chan c)
+        {
+            if (c.Selected) Deselect(c); else Select(c);
+        }
+
+        private void ToggleMute(Chan c)
+        {
+            c.Muted = !c.Muted;
+            AddLog($"{c.Cfg.Name}: {(c.Muted ? "muted" : "unmuted")}");
+        }
+
+        private void ToggleGlobalMute()
+        {
+            globalMute = !globalMute;
+            AddLog(globalMute ? "all receive audio muted" : "receive audio unmuted");
+        }
+
+        private static void Louder(Chan c) => c.Gain = Math.Min(8.0, c.Gain * 1.25);
+
+        private static void Quieter(Chan c) => c.Gain = Math.Max(0.25, c.Gain / 1.25);
+
+        private void RequestKey(Chan c)
+        {
+            if (c.Encrypted && KeyStore.IsSupported(c.KeyRequestAlg))
+                peer?.RequestKey(c.KeyRequestAlg, c.KeyId);
+            else
+                AddLog($"{c.Cfg.Name}: clear channel, no key needed");
         }
 
         /*
@@ -282,7 +334,7 @@ namespace dvmcli
                 AddLog($"{c.Cfg.Name}: receive-only channel");
                 return;
             }
-            if (!peer.Connected)
+            if (peer == null || !peer.Connected)
             {
                 AddLog("not connected to the FNE yet");
                 return;
@@ -338,6 +390,8 @@ namespace dvmcli
             txChan = null;
         }
 
+        private bool Transmitting => tx != null && tx.IsTransmitting;
+
         private void Housekeeping()
         {
             string stop = pendingTxStop;
@@ -347,7 +401,7 @@ namespace dvmcli
                 StopTx(stop);
             }
 
-            if (tx != null && tx.IsTransmitting && DateTime.Now - tx.StartedAt > txLimit)
+            if (Transmitting && DateTime.Now - tx.StartedAt > txLimit)
                 StopTx($"{txLimit.TotalSeconds:F0} s transmit limit reached");
         }
 
@@ -355,169 +409,347 @@ namespace dvmcli
         ** Input
         */
 
-        private void HandleKey(ConsoleKeyInfo k)
+        /// <summary>
+        /// Handles one key or mouse event (internal for the self-test).
+        /// </summary>
+        internal void HandleInput(InputEvent e)
         {
-            Chan c = chans[cursor];
-            switch (k.Key)
+            GridGeometry g = Layout(screen.Width, screen.Height, chans.Count);
+            switch (e.Kind)
             {
-                case ConsoleKey.UpArrow:
-                    cursor = Math.Max(0, cursor - 1);
-                    break;
-                case ConsoleKey.DownArrow:
-                    cursor = Math.Min(chans.Count - 1, cursor + 1);
-                    break;
-                case ConsoleKey.PageUp:
-                    cursor = Math.Max(0, cursor - 10);
-                    break;
-                case ConsoleKey.PageDown:
-                    cursor = Math.Min(chans.Count - 1, cursor + 10);
-                    break;
-                case ConsoleKey.Home:
-                    cursor = 0;
-                    break;
-                case ConsoleKey.End:
-                    cursor = chans.Count - 1;
-                    break;
-                case ConsoleKey.Enter:
-                    if (c.Selected) Deselect(c); else Select(c);
-                    break;
-                case ConsoleKey.Spacebar:
-                    ToggleTx();
-                    break;
-                case ConsoleKey.Escape:
-                    StopTx(null);
-                    break;
-                default:
-                    switch (char.ToLowerInvariant(k.KeyChar))
+                case InputKind.Click:
+                    screen.HitTest(e.X, e.Y)?.Invoke();
+                    return;
+
+                case InputKind.WheelUp:
+                case InputKind.WheelDown:
+                {
+                    int dir = e.Kind == InputKind.WheelUp ? -1 : 1;
+                    if (g.LogHeight > 0 && e.Y >= g.LogTop)
+                        logOffset = Math.Max(0, logOffset - dir * 3);
+                    else
                     {
-                        case 'q':
-                            quit = true;
-                            break;
-                        case 'm':
-                            c.Muted = !c.Muted;
-                            AddLog($"{c.Cfg.Name}: {(c.Muted ? "muted" : "unmuted")}");
-                            break;
-                        case '+':
-                        case '=':
-                            c.Gain = Math.Min(8.0, c.Gain * 1.25);
-                            break;
-                        case '-':
-                            c.Gain = Math.Max(0.25, c.Gain / 1.25);
-                            break;
-                        case 'k':
-                            if (c.Encrypted && KeyStore.IsSupported(c.KeyRequestAlg))
-                                peer.RequestKey(c.KeyRequestAlg, c.KeyId);
-                            else
-                                AddLog($"{c.Cfg.Name}: clear channel, no key needed");
-                            break;
+                        scrollRow += dir;
+                        followCursor = false;
+                    }
+                    return;
+                }
+            }
+
+            Chan c = chans[cursor];
+            int page = Math.Max(1, g.VisibleRows) * g.Columns;
+            switch (e.Key)
+            {
+                case InputKey.Left: MoveCursor(-1); break;
+                case InputKey.Right: MoveCursor(1); break;
+                case InputKey.Tab: MoveCursor(1); break;
+                case InputKey.Up: MoveCursor(-g.Columns); break;
+                case InputKey.Down: MoveCursor(g.Columns); break;
+                case InputKey.PageUp: MoveCursor(-page); break;
+                case InputKey.PageDown: MoveCursor(page); break;
+                case InputKey.Home: MoveCursor(-chans.Count); break;
+                case InputKey.End: MoveCursor(chans.Count); break;
+                case InputKey.Enter: ToggleSelect(c); break;
+                case InputKey.Space: ToggleTx(); break;
+                case InputKey.Escape: StopTx(null); break;
+                case InputKey.CtrlC: quit = true; break;
+                case InputKey.Char:
+                    switch (e.Char)
+                    {
+                        case 'q': case 'Q': quit = true; break;
+                        case 'm': ToggleMute(c); break;
+                        case 'M': ToggleGlobalMute(); break;
+                        case '+': case '=': Louder(c); break;
+                        case '-': case '_': Quieter(c); break;
+                        case 'k': case 'K': RequestKey(c); break;
                     }
                     break;
             }
         }
 
+        private void MoveCursor(int delta)
+        {
+            cursor = Math.Clamp(cursor + delta, 0, chans.Count - 1);
+            followCursor = true;
+        }
+
+        private void Focus(int index)
+        {
+            cursor = index;
+            followCursor = true;
+        }
+
         /*
-        ** Rendering
+        ** Layout and rendering
         */
 
-        private void Render(Layout layout)
+        /// <summary>
+        /// Works out the card grid for a terminal size: up to four cards across, at least <see cref="MinCardWidth"/>
+        /// wide, and as many card rows as fit while leaving room for the log.
+        /// </summary>
+        public static GridGeometry Layout(int width, int height, int cardCount)
         {
-            string conn = peer.Connected ? "[green]● connected[/]" : "[yellow]○ connecting…[/]";
-            layout["header"].Update(new Panel(new Markup(
-                $"[bold]dvmcli[/]  {Esc(system.Name)} ({Esc(system.Address)}:{system.Port})  peer {system.PeerId}  RID {peer.ConsoleRid}  {conn}  keys held: {keys.Count}"))
-            { Expand = true, Border = BoxBorder.Rounded });
+            int cols = Math.Clamp(width / MinCardWidth, 1, MaxColumns);
+            int cardW = width / cols;
+            int totalRows = (cardCount + cols - 1) / cols;
+            int avail = Math.Max(0, height - TitleHeight - FooterHeight);
+            int visible = Math.Clamp((avail - MinLogHeight) / CardHeight, 1, Math.Max(1, totalRows));
+            int gridH = Math.Min(visible * CardHeight, avail);
+            int logH = avail - gridH;
+            if (logH < 3)
+                logH = 0;
+            return new GridGeometry(cols, cardW, visible, totalRows, TitleHeight, TitleHeight + gridH, logH);
+        }
 
-            layout["channels"].Update(new Panel(ChannelTable()) { Expand = true, Header = new PanelHeader(" Channels ") });
-
-            int logRows = Math.Max(3, Console.WindowHeight - 3 - 4 - 2);
-            List<string> lines;
-            lock (uiLock)
-                lines = log.Skip(Math.Max(0, log.Count - logRows)).ToList();
-            IRenderable logBody = lines.Count == 0 ? new Markup("[grey]no activity yet[/]") : new Rows(lines.Select(l => new Markup(Esc(l))));
-            layout["log"].Update(new Panel(logBody) { Expand = true, Header = new PanelHeader(" Log ") });
-
-            string txLine;
-            P25Transmitter t = tx;
-            if (t != null && t.IsTransmitting)
+        /// <summary>
+        /// Draws one frame into the screen buffer (and registers the clickable regions).
+        /// </summary>
+        internal ScreenBuffer Render(int width, int height)
+        {
+            screen.Begin(width, height);
+            if (width < 40 || height < TitleHeight + FooterHeight + CardHeight)
             {
-                TimeSpan held = DateTime.Now - t.StartedAt;
-                txLine = $"[bold white on red] ● TRANSMITTING [/] [bold]{Esc(txChan?.Cfg.Name ?? "?")}[/] tg {t.Talkgroup} " +
-                         $"{(t.Encrypted ? Esc(KeyStore.AlgorithmName(t.AlgorithmId)) : "clear")}  {held:mm\\:ss} / {txLimit:mm\\:ss}   [grey](Space or Esc to stop)[/]";
+                screen.Text(0, 0, "dvmcli: terminal too small", Style.Of(Ansi.Yellow, bold: true));
+                screen.Text(0, 1, "make the window bigger, or press q to quit", Style.Plain);
+                return screen;
+            }
+
+            GridGeometry g = Layout(width, height, chans.Count);
+            DrawTitle(width);
+
+            // scrolling: keep the focused card in view after keyboard moves; the wheel scrolls freely
+            int maxScroll = Math.Max(0, g.TotalRows - g.VisibleRows);
+            if (followCursor)
+            {
+                int row = cursor / g.Columns;
+                if (row < scrollRow) scrollRow = row;
+                if (row >= scrollRow + g.VisibleRows) scrollRow = row - g.VisibleRows + 1;
+            }
+            scrollRow = Math.Clamp(scrollRow, 0, maxScroll);
+
+            for (int vr = 0; vr < g.VisibleRows; vr++)
+                for (int col = 0; col < g.Columns; col++)
+                {
+                    int idx = (scrollRow + vr) * g.Columns + col;
+                    if (idx >= chans.Count)
+                        break;
+                    DrawCard(idx, new Rect(col * g.CardWidth, g.GridTop + vr * CardHeight, g.CardWidth, CardHeight));
+                }
+
+            if (maxScroll > 0)
+            {
+                string more = $" {scrollRow + 1}-{Math.Min(g.TotalRows, scrollRow + g.VisibleRows)} of {g.TotalRows} rows ";
+                screen.TextRight(width - 1, g.LogTop - 1, more, Style.Of(Ansi.Grey));
+            }
+
+            if (g.LogHeight > 0)
+                DrawLog(new Rect(0, g.LogTop, width, g.LogHeight));
+            DrawFooter(width, height);
+            return screen;
+        }
+
+        private void DrawTitle(int width)
+        {
+            // buttons: three rows tall so they're easy to hit
+            const int pttW = 10, muteW = 9, exitW = 8;
+            int x = width - (pttW + muteW + exitW + 2);
+
+            bool txOn = Transmitting;
+            Button(new Rect(x, 0, pttW, TitleHeight), txOn ? "● TX" : "PTT",
+                   txOn ? Style.Of(Ansi.BrightWhite, Ansi.Red, bold: true) : Style.Of(Ansi.BrightWhite, Ansi.Blue, bold: true), ToggleTx);
+            x += pttW + 1;
+            Button(new Rect(x, 0, muteW, TitleHeight), globalMute ? "MUTED" : "MUTE",
+                   globalMute ? Style.Of(Ansi.Black, Ansi.Yellow, bold: true) : Style.Of(Ansi.BrightWhite, Ansi.Grey, bold: true), ToggleGlobalMute);
+            x += muteW + 1;
+            Button(new Rect(x, 0, exitW, TitleHeight), "EXIT", Style.Of(Ansi.BrightWhite, Ansi.Magenta, bold: true), () => quit = true);
+
+            // system box
+            int boxW = width - (pttW + muteW + exitW + 3);
+            Style frame = Style.Of(Ansi.Cyan);
+            screen.Box(new Rect(0, 0, boxW, TitleHeight), frame);
+            screen.Text(2, 0, " dvmcli ", Style.Of(Ansi.BrightCyan, bold: true));
+
+            int tx0 = 2, inner = boxW - 4;
+            bool connected = peer?.Connected == true;
+            int used = screen.Text(tx0, 1, system.Name, Style.Of(Ansi.BrightWhite, bold: true), inner);
+            used += screen.Text(tx0 + used, 1, connected ? "  ● connected" : "  ○ connecting…",
+                                connected ? Style.Of(Ansi.BrightGreen) : Style.Of(Ansi.Yellow), inner - used);
+            screen.Text(tx0 + used, 1, $"  peer {system.PeerId}  RID {peer?.ConsoleRid ?? 0}  keys {keys.Count}", Style.Of(Ansi.White), inner - used);
+        }
+
+        private void Button(Rect r, string label, Style style, Action action)
+        {
+            screen.Fill(r, style);
+            int lw = ScreenBuffer.TextWidth(label);
+            screen.Text(r.X + Math.Max(0, (r.W - lw) / 2), r.Y + r.H / 2, label, style, r.W);
+            screen.OnClick(r, action);
+        }
+
+        private void DrawCard(int idx, Rect r)
+        {
+            Chan c = chans[idx];
+            bool focused = idx == cursor;
+            bool txHere = Transmitting && txChan == c;
+            P25VoiceReceiver rx = c.Rx;
+            bool rxHere = c.Selected && rx != null && rx.InCall;
+
+            Style border = txHere ? Style.Of(Ansi.BrightRed, bold: true)
+                : rxHere ? Style.Of(Ansi.BrightGreen, bold: true)
+                : focused ? Style.Of(Ansi.BrightWhite, bold: true)
+                : c.Selected ? Style.Of(Ansi.Green)
+                : Style.Of(Ansi.Grey);
+            Style dim = Style.Of(Ansi.Grey);
+
+            // whole card: focus it and start listening
+            screen.OnClick(r, () =>
+            {
+                Focus(idx);
+                if (!c.Selected) Select(c);
+            });
+
+            Rect box = new Rect(r.X, r.Y, r.W - 1, r.H);    // one column gap between cards
+            screen.Box(box, border);
+            int ix = box.X + 2, iw = box.W - 4, right = box.X + box.W - 2;
+
+            // title and listen toggle
+            string toggle = c.Selected ? "[●]" : "[ ]";
+            int toggleX = right - 3;
+            screen.Text(box.X + 1, box.Y, focused ? "▶" : "─", border);
+            Style nameStyle = !c.IsP25 ? dim : focused || c.Selected ? Style.Of(Ansi.BrightWhite, bold: true) : Style.Of(Ansi.White);
+            screen.Text(ix, box.Y, $" {c.Cfg.Name} ", nameStyle, toggleX - ix - 1);
+            screen.Text(toggleX, box.Y, toggle, c.Selected ? Style.Of(Ansi.BrightGreen, bold: true) : dim);
+            screen.OnClick(new Rect(toggleX - 1, box.Y, 5, 1), () =>
+            {
+                Focus(idx);
+                ToggleSelect(c);
+            });
+
+            int y = box.Y + 1;
+            if (!c.IsP25)
+            {
+                screen.Text(ix, y, c.Tg != 0 ? $"TG {c.Tg}" : $"TG {c.Cfg.Tgid}", dim, iw);
+                screen.Text(ix, y + 1, $"{c.Cfg.Mode} · not supported yet", dim, iw);
+                return;
+            }
+
+            // line 1: talkgroup and crypto
+            screen.Text(ix, y, $"TG {c.Tg}", Style.Of(Ansi.BrightWhite), iw);
+            string crypt = c.Encrypted ? $"{KeyStore.AlgorithmName(c.TxAlg)} 🔒" : "clear";
+            screen.TextRight(right, y, crypt, c.Encrypted ? Style.Of(Ansi.BrightYellow) : dim);
+
+            // line 2: key
+            if (c.Encrypted)
+            {
+                bool have = keys.TryGet(c.KeyRequestAlg, c.KeyId, out _);
+                screen.Text(ix, y + 1, have ? $"key ✓ {c.KeyId:X4}" : $"key – {c.KeyId:X4}  (k: request)",
+                            have ? Style.Of(Ansi.Green) : Style.Of(Ansi.Yellow), iw);
             }
             else
-                txLine = "[grey]not transmitting[/]";
+                screen.Text(ix, y + 1, c.Cfg.RxOnly ? "receive only" : "no encryption", dim, iw);
 
-            layout["footer"].Update(new Panel(new Rows(
-                new Markup(txLine),
-                new Markup("[grey]↑↓ move  Enter select/deselect  Space PTT toggle  m mute  +/- volume  k request key  q quit[/]")))
-            { Expand = true });
+            // line 3: status
+            DrawStatus(c, rx, txHere, rxHere, ix, y + 2, iw);
+
+            // line 4: last call
+            if (!string.IsNullOrEmpty(c.LastCall))
+                screen.Text(ix, y + 3, $"last {c.LastCall}", dim, iw);
+
+            // line 5: volume and mute, clickable
+            int vx = ix;
+            vx += screen.Text(vx, y + 4, $"vol {c.Gain:0.##}x ", c.Selected ? Style.Of(Ansi.White) : dim, iw);
+            vx = SmallButton(vx, y + 4, "[-]", dim, () => { Focus(idx); Quieter(c); }, ix + iw);
+            vx = SmallButton(vx, y + 4, "[+]", dim, () => { Focus(idx); Louder(c); }, ix + iw);
+            SmallButton(vx + 1, y + 4, c.Muted ? "[MUTED]" : "[mute]",
+                        c.Muted ? Style.Of(Ansi.Black, Ansi.Yellow, bold: true) : dim, () => { Focus(idx); ToggleMute(c); }, ix + iw);
         }
 
-        private IRenderable ChannelTable()
+        private int SmallButton(int x, int y, string label, Style style, Action action, int limit)
         {
-            Table table = new Table { Border = TableBorder.Simple, Expand = true };
-            table.AddColumn(new TableColumn(string.Empty).Width(1));
-            table.AddColumn("Channel");
-            table.AddColumn(new TableColumn("TG").RightAligned());
-            table.AddColumn("Crypto");
-            table.AddColumn("Key");
-            table.AddColumn("Status");
-            table.AddColumn("Last call");
-            table.AddColumn(new TableColumn("Vol").RightAligned());
+            int w = ScreenBuffer.TextWidth(label);
+            if (x + w > limit)
+                return x;
+            screen.Text(x, y, label, style);
+            screen.OnClick(new Rect(x, y, w, 1), action);
+            return x + w;
+        }
 
-            // keep the cursor in view
-            int visible = Math.Max(1, Console.WindowHeight - 3 - 4 - 6);
-            int first = Math.Clamp(cursor - visible / 2, 0, Math.Max(0, chans.Count - visible));
-
-            for (int i = first; i < Math.Min(chans.Count, first + visible); i++)
+        private void DrawStatus(Chan c, P25VoiceReceiver rx, bool txHere, bool rxHere, int x, int y, int w)
+        {
+            if (txHere)
             {
-                Chan c = chans[i];
-                bool here = i == cursor;
-                string name = Esc(c.Cfg.Name);
-                if (!c.IsP25) name = $"[grey]{name} ({Esc(c.Cfg.Mode)})[/]";
-                else if (c.Selected) name = $"[bold]{name}[/]";
-                if (here) name = $"[reverse]{name}[/]";
-
-                string crypto = !c.IsP25 ? string.Empty : c.Encrypted ? Esc(KeyStore.AlgorithmName(c.TxAlg)) : "[grey]clear[/]";
-                string key = !c.Encrypted ? string.Empty
-                    : keys.TryGet(c.KeyRequestAlg, c.KeyId, out _) ? $"[green]✓ {c.KeyId:X4}[/]" : $"[yellow]– {c.KeyId:X4}[/]";
-
-                table.AddRow(
-                    new Markup(here ? "[bold]▶[/]" : " "),
-                    new Markup(name),
-                    new Markup(c.Tg != 0 ? c.Tg.ToString() : "?"),
-                    new Markup(crypto),
-                    new Markup(key),
-                    new Markup(StatusCell(c)),
-                    new Markup(Esc(c.LastCall)),
-                    new Markup(c.Selected ? $"{c.Gain:0.##}x" : string.Empty));
+                TimeSpan held = DateTime.Now - tx.StartedAt;
+                Style s = Style.Of(Ansi.BrightWhite, Ansi.Red, bold: true);
+                screen.Fill(new Rect(x, y, w, 1), s);
+                screen.Text(x, y, $" ● TX {peer?.ConsoleRid}  {held:mm\\:ss}", s, w);
+                return;
             }
 
-            return table;
-        }
-
-        private string StatusCell(Chan c)
-        {
-            P25Transmitter t = tx;
-            if (t != null && t.IsTransmitting && txChan == c)
-                return "[bold white on red] TX [/]";
-
-            P25VoiceReceiver rx = c.Rx;
-            if (c.Selected && rx != null && rx.InCall)
+            if (rxHere)
             {
                 byte alg = rx.CurrentAlgorithm;
                 bool enc = alg != 0 && alg != P25Defines.P25_ALGO_UNENCRYPT;
-                string lockMark = enc ? " 🔒" : string.Empty;
-                string noKey = enc && rx.CallHasMuted && !keys.TryGet(alg, rx.CurrentKeyId, out _) ? " [yellow]no key[/]" : string.Empty;
-                return $"[bold black on green] RX {rx.CurrentSource} [/]{lockMark}{noKey}{(c.Muted ? " [grey](muted)[/]" : string.Empty)}";
+                bool noKey = enc && rx.CallHasMuted && !keys.TryGet(alg, rx.CurrentKeyId, out _);
+                Style s = noKey ? Style.Of(Ansi.Black, Ansi.Yellow, bold: true) : Style.Of(Ansi.Black, Ansi.BrightGreen, bold: true);
+                screen.Fill(new Rect(x, y, w, 1), s);
+                string text = $" RX {rx.CurrentSource}{(enc ? " 🔒" : string.Empty)}{(noKey ? " no key" : string.Empty)}{(c.Muted || globalMute ? " (muted)" : string.Empty)}";
+                screen.Text(x, y, text, s, w);
+                return;
             }
 
             if (!c.Selected && c.Active)
-                return $"[grey]busy {c.ActiveSrc}[/]";
+                screen.Text(x, y, $"busy {c.ActiveSrc}", Style.Of(Ansi.Cyan), w);
+            else if (c.Selected)
+                screen.Text(x, y, c.Muted || globalMute ? "listening (muted)" : "listening", c.Muted || globalMute ? Style.Of(Ansi.Yellow) : Style.Of(Ansi.Green), w);
+            else
+                screen.Text(x, y, "click to listen", Style.Of(Ansi.Grey), w);
+        }
 
-            if (c.Selected)
-                return c.Muted ? "[grey]listening (muted)[/]" : "[green]listening[/]";
+        private void DrawLog(Rect r)
+        {
+            screen.Box(r, Style.Of(Ansi.Grey));
+            screen.Text(r.X + 2, r.Y, " Log ", Style.Of(Ansi.White, bold: true));
 
-            return string.Empty;
+            int rows = r.H - 2;
+            List<string> lines;
+            lock (uiLock)
+            {
+                logOffset = Math.Clamp(logOffset, 0, Math.Max(0, log.Count - rows));
+                lines = log.Reverse().Skip(logOffset).Take(rows).Reverse().ToList();
+            }
+            if (logOffset > 0)
+                screen.TextRight(r.X + r.W - 2, r.Y, $" ↑ {logOffset} newer below ", Style.Of(Ansi.Yellow));
+
+            for (int i = 0; i < lines.Count; i++)
+            {
+                string l = lines[i];
+                Style s = l.Contains("TX ") ? Style.Of(Ansi.BrightRed)
+                    : l.Contains(": RX ") ? Style.Of(Ansi.BrightGreen)
+                    : l.Contains("error", StringComparison.OrdinalIgnoreCase) || l.Contains("not transmitting") ? Style.Of(Ansi.Yellow)
+                    : Style.Plain;
+                screen.Text(r.X + 2, r.Y + 1 + i, l, s, r.W - 4);
+            }
+        }
+
+        private void DrawFooter(int width, int height)
+        {
+            int y = height - FooterHeight;
+            if (Transmitting)
+            {
+                TimeSpan held = DateTime.Now - tx.StartedAt;
+                Style s = Style.Of(Ansi.BrightWhite, Ansi.Red, bold: true);
+                screen.Fill(new Rect(0, y, width, 1), s);
+                screen.Text(1, y, $"● TRANSMITTING  {txChan?.Cfg.Name}  tg {tx.Talkgroup}  {(tx.Encrypted ? KeyStore.AlgorithmName(tx.AlgorithmId) : "clear")}  " +
+                                  $"{held:mm\\:ss} / {txLimit:mm\\:ss}   (Space, Esc or PTT to stop)", s, width - 2);
+            }
+            else
+            {
+                Chan c = chans[cursor];
+                string target = c.IsP25 ? $"PTT → {c.Cfg.Name} (tg {c.Tg}, {(c.Encrypted ? KeyStore.AlgorithmName(c.TxAlg) : "clear")})" : $"{c.Cfg.Name}: no transmit on {c.Cfg.Mode}";
+                screen.Text(1, y, target, Style.Of(Ansi.White), width - 2);
+            }
+
+            screen.Text(1, y + 1, "click card: listen  [●]: stop  arrows: move  Enter: listen  Space: PTT  m/M: mute card/all  +/-: vol  k: key  q: quit",
+                        Style.Of(Ansi.Grey), width - 2);
         }
 
         /*
@@ -526,12 +758,15 @@ namespace dvmcli
 
         private void AddLog(string message)
         {
+            message = (message ?? string.Empty).Replace("(DVMCLI) ", string.Empty);
             string line = $"{DateTime.Now:HH:mm:ss} {message}";
             lock (uiLock)
             {
                 log.AddLast(line);
                 while (log.Count > MaxLogLines)
                     log.RemoveFirst();
+                if (logOffset > 0)
+                    logOffset++;    // scrolled back: keep looking at the same lines
             }
 
             if (logFile != null)
@@ -540,7 +775,5 @@ namespace dvmcli
                 catch { /* ignore */ }
             }
         }
-
-        private static string Esc(string s) => Markup.Escape(s ?? string.Empty);
     } // public sealed class Tui
 }

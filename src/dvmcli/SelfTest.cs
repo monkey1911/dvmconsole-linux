@@ -183,6 +183,9 @@ namespace dvmcli
                 Check(ch != null && ch.Tgid == "504" && ch.GetChannelMode() == Codeplug.ChannelMode.P25 && ch.SelectableEncryption, "codeplug channel parsed (including dev-only keys)");
                 Check(sec != null && sec.GetKeyRequestAlgoId() == P25Defines.P25_ALGO_AES && sec.GetKeyId() == TestKeyId, "encrypted channel's algorithm and key ID read from the codeplug");
 
+                // 9. TUI: card grid, buttons and clicks (no terminal or network needed)
+                TuiTests(cp, sys);
+
                 // 8. WAV writer
                 string wavPath = Path.Combine(tmp, "test.wav");
                 using (WavSink wav = new WavSink(wavPath))
@@ -200,6 +203,68 @@ namespace dvmcli
 
             Console.WriteLine(failures == 0 ? "ALL TESTS PASSED" : $"{failures} TEST(S) FAILED");
             return failures == 0 ? 0 : 1;
+        }
+
+        private static void TuiTests(Codeplug cp, Codeplug.System sys)
+        {
+            // input parser
+            InputParser parser = new InputParser();
+            List<InputEvent> ev = parser.Feed(System.Text.Encoding.ASCII.GetBytes("\x1b[A\x1b[B\x1b[C\x1b[D \rq\x03"));
+            Check(ev.Select(e => e.Key).SequenceEqual(new[] { InputKey.Up, InputKey.Down, InputKey.Right, InputKey.Left, InputKey.Space, InputKey.Enter, InputKey.Char, InputKey.CtrlC }) &&
+                  ev[6].Char == 'q', "TUI input: arrows, Space, Enter, letters and Ctrl+C parsed");
+            ev = parser.Feed(System.Text.Encoding.ASCII.GetBytes("\x1b[<0;12;5M\x1b[<0;12;5m\x1b[<64;3;4M\x1b[<65;3;4M\x1b[5~\x1b[6~"));
+            Check(ev.Count == 5 && ev[0].Kind == InputKind.Click && ev[0].X == 11 && ev[0].Y == 4 && ev[1].Kind == InputKind.WheelUp &&
+                  ev[2].Kind == InputKind.WheelDown && ev[3].Key == InputKey.PageUp && ev[4].Key == InputKey.PageDown, "TUI input: SGR mouse click (release ignored) and wheel parsed");
+            Check(parser.Feed(new byte[] { 0x1b, (byte)'[', (byte)'<', (byte)'0', (byte)';' }).Count == 0 &&
+                  parser.Feed(System.Text.Encoding.ASCII.GetBytes("7;2M")) is { Count: 1 } split && split[0].Kind == InputKind.Click && split[0].X == 6,
+                  "TUI input: a mouse report split across reads is reassembled");
+            ev = parser.Feed(new byte[] { 0x1b });
+            Check(ev.Count == 1 && ev[0].Key == InputKey.Escape, "TUI input: a lone Esc is the Escape key");
+
+            // screen buffer
+            ScreenBuffer sb = new ScreenBuffer();
+            sb.Begin(20, 3);
+            int used = sb.Text(0, 0, "AES 🔒 x", Style.Plain);
+            Check(used == 8 && sb.RowText(0).StartsWith("AES 🔒 x"), "TUI screen: the lock emoji takes two cells");
+            sb.Text(0, 1, "abcdefghijklmnop", Style.Plain, 6);
+            Check(sb.RowText(1).StartsWith("abcde… "), "TUI screen: long text is truncated with an ellipsis");
+            bool hit = false;
+            sb.OnClick(new Rect(2, 2, 4, 1), () => hit = true);
+            sb.HitTest(3, 2)?.Invoke();
+            Check(hit && sb.HitTest(6, 2) == null, "TUI screen: clicks map to the region under the pointer");
+            Check(sb.Flush().Contains("🔒") && !sb.Flush().Contains("🔒"), "TUI screen: unchanged frames send nothing new");
+
+            // grid geometry
+            Tui.GridGeometry g = Tui.Layout(120, 40, 10);
+            Check(g.Columns == 4 && g.CardWidth == 30 && g.TotalRows == 3 && g.LogHeight >= 6, $"TUI grid: 4 cards across at 120 columns ({g.VisibleRows} rows visible, log {g.LogHeight})");
+            Check(Tui.Layout(60, 40, 10).Columns == 2 && Tui.Layout(300, 40, 10).Columns == 4, "TUI grid: fewer columns on narrow terminals, never more than 4");
+
+            // clicks on a rendered frame
+            Tui tui = new Tui(cp, sys, TimeSpan.FromSeconds(120), null) { NoAudio = true };
+            ScreenBuffer frame = tui.Render(120, 40);
+            Check(frame.RowText(1).Contains("PTT") && frame.RowText(1).Contains("MUTE") && frame.RowText(1).Contains("EXIT"), "TUI title bar has PTT, MUTE and EXIT buttons");
+            Check(frame.RowText(Tui.TitleHeight).Contains("Calling") && frame.RowText(Tui.TitleHeight).Contains("Secure"), "TUI cards for both channels drawn side by side");
+            Check(frame.RowText(Tui.TitleHeight + 1).Contains("🔒"), "TUI secure card shows the lock");
+
+            tui.HandleInput(new InputEvent(InputKind.Click, X: 30 + 5, Y: Tui.TitleHeight + 3));    // body of card 2
+            Check(tui.Cursor == 1 && tui.IsSelected(1) && !tui.IsSelected(0), "TUI click on a card focuses it and starts listening");
+            tui.Render(120, 40);
+            string top = tui.Render(120, 40).RowText(Tui.TitleHeight);
+            int toggle = top.IndexOf("[●]", StringComparison.Ordinal);
+            Check(toggle > 30, "TUI listening card shows [●]");
+            tui.HandleInput(new InputEvent(InputKind.Click, X: toggle + 1, Y: Tui.TitleHeight));
+            Check(!tui.IsSelected(1), "TUI click on [●] stops listening");
+
+            tui.Render(120, 40);
+            string title = tui.Render(120, 40).RowText(1);
+            tui.HandleInput(new InputEvent(InputKind.Click, X: title.IndexOf("MUTE", StringComparison.Ordinal), Y: 0));
+            Check(tui.GlobalMute, "TUI MUTE button mutes all audio");
+            tui.Render(120, 40);
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Left));
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Space));    // PTT while offline: refused, no crash
+            tui.Render(120, 40);
+            tui.HandleInput(new InputEvent(InputKind.Click, X: title.IndexOf("EXIT", StringComparison.Ordinal), Y: 2));
+            Check(tui.Cursor == 0 && tui.QuitRequested, "TUI keyboard focus, offline PTT refusal and EXIT button");
         }
 
         /// <summary>

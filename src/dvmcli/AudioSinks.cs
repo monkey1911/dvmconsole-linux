@@ -46,9 +46,10 @@ namespace dvmcli
             ProcessStartInfo psi = new ProcessStartInfo(Command)
             {
                 UseShellExecute = false,
+                // all three redirected: the child never touches the terminal (the TUI owns it in raw mode)
                 RedirectStandardInput = true,
-                RedirectStandardOutput = false,
-                RedirectStandardError = false
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
             };
 
             // pw-cat needs --playback; pw-play is pw-cat in playback mode already
@@ -61,7 +62,14 @@ namespace dvmcli
 
             player = Process.Start(psi) ?? throw new InvalidOperationException($"failed to start {Command}");
             stdin = player.StandardInput.BaseStream;
+            player.OutputDataReceived += (_, _) => { };
+            player.ErrorDataReceived += (_, _) => { };
+            player.BeginOutputReadLine();
+            player.BeginErrorReadLine();
         }
+
+        /// <summary>Raised once if the player stops unexpectedly.</summary>
+        public event Action<string> Failed;
 
         /// <summary>
         /// Finds pw-play or pw-cat on PATH.
@@ -97,7 +105,8 @@ namespace dvmcli
             catch (IOException)
             {
                 failed = true;
-                Console.Error.WriteLine($"audio: {Command} stopped (exit code {(player.HasExited ? player.ExitCode : -1)}); playback disabled");
+                string msg = $"audio: {Command} stopped (exit code {(player.HasExited ? player.ExitCode : -1)}); playback disabled";
+                if (Failed != null) Failed(msg); else Console.Error.WriteLine(msg);
             }
         }
 
