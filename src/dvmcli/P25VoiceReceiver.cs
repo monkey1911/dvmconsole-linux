@@ -86,6 +86,13 @@ namespace dvmcli
         /// <summary>Raised once per call when an encrypted call needs a key the store doesn't have.</summary>
         public event Action<byte, ushort> KeyNeeded;
 
+        /// <summary>
+        /// Raised with a copy of each IMBE codeword (decrypted if the call is encrypted) just before it is decoded.
+        /// Decoded audio itself is not bit-exact between runs (IMBE synthesizes unvoiced sound from random noise),
+        /// so this is the deterministic point to test against.
+        /// </summary>
+        public event Action<byte[]> Codeword;
+
         /// <summary>Number of IMBE frames decoded since start.</summary>
         public long FramesDecoded { get; private set; }
 
@@ -166,6 +173,8 @@ namespace dvmcli
                         callMuted++;
                         continue;
                     }
+
+                    Codeword?.Invoke((byte[])imbe.Clone());
 
                     short[] samples = new short[FrameSamples];
                     decoder.decode(imbe, samples);

@@ -64,9 +64,6 @@ namespace dvmcli
             Check(rms > 100, $"IMBE round trip produces audio (output RMS {rms:F0})");
             Check(codewords.Select(c => Convert.ToHexString(c)).Distinct().Count() > 1, "encoder output varies frame to frame");
 
-            // reference: what a fresh decoder makes of the clear codewords
-            short[] reference = DecodeAll(codewords);
-
             // 2. codeword extraction from a network LDU frame
             byte[] ldu1 = BuildLduFrame(P25VoiceReceiver.Ldu1FirstRecord, codewords.Take(9).ToList());
             byte[] ldu2 = BuildLduFrame(P25VoiceReceiver.Ldu2FirstRecord, codewords.Skip(9).Take(9).ToList());
@@ -91,8 +88,10 @@ namespace dvmcli
             using (P25VoiceReceiver rx = new P25VoiceReceiver(504))
             {
                 List<short> audio = new List<short>();
+                List<byte[]> fed = new List<byte[]>();
                 List<string> status = new List<string>();
                 rx.Audio += s => audio.AddRange(s);
+                rx.Codeword += fed.Add;
                 rx.Status += status.Add;
 
                 rx.Handle(999, 1234, P25DUID.LDU1, 77, ldu1);           // other talkgroup
@@ -104,7 +103,8 @@ namespace dvmcli
 
                 Check(rx.CallsSeen == 1, "one call start detected");
                 Check(rx.FramesDecoded == frames && rx.FramesMuted == 0, $"clear call: all {frames} voice frames played");
-                Check(audio.SequenceEqual(reference), "clear call audio matches a direct decode exactly");
+                Check(SameCodewords(fed, codewords), "clear call: decoder fed exactly the transmitted codewords, in order");
+                Check(Rms(audio) > 100, $"clear call audio is not silent (RMS {Rms(audio):F0})");
                 Check(status.Any(s => s.StartsWith("CALL START")) && status.Any(s => s.StartsWith("CALL END") && s.Contains("clear")), "call start and end reported");
             }
 
@@ -123,9 +123,11 @@ namespace dvmcli
             using (P25VoiceReceiver rx = new P25VoiceReceiver(500, keys))
             {
                 List<short> audio = new List<short>();
+                List<byte[]> fed = new List<byte[]>();
                 List<string> status = new List<string>();
                 int keyRequests = 0;
                 rx.Audio += s => audio.AddRange(s);
+                rx.Codeword += fed.Add;
                 rx.Status += status.Add;
                 rx.KeyNeeded += (_, _) => keyRequests++;
 
@@ -137,7 +139,8 @@ namespace dvmcli
                 rx.Handle(500, 1234, P25DUID.TDU, 50, new byte[24]);
 
                 Check(rx.FramesDecoded == frames && rx.FramesMuted == 0 && keyRequests == 0, $"AES call: all {frames} frames decrypted, no key request needed");
-                Check(audio.SequenceEqual(reference), "decrypted audio matches the clear audio exactly (MI cycled across 5 superframes)");
+                Check(SameCodewords(fed, codewords), "AES call: every codeword decrypts back to the clear original (MI cycled across 5 superframes)");
+                Check(Rms(audio) > 100, $"decrypted call audio is not silent (RMS {Rms(audio):F0})");
                 Check(status.Any(s => s.Contains("decrypting AES-256 key 0x0561")), "decryption reported");
             }
 
@@ -196,21 +199,11 @@ namespace dvmcli
             return failures == 0 ? 0 : 1;
         }
 
-        /// <summary>
-        /// Decodes codewords with a fresh decoder, as the receiver does at the start of a call.
-        /// </summary>
-        private static short[] DecodeAll(List<byte[]> codewords)
-        {
-            MBEDecoder d = new MBEDecoder(MBE_MODE.IMBE_88BIT);
-            List<short> all = new List<short>();
-            foreach (byte[] cw in codewords)
-            {
-                short[] s = new short[P25VoiceReceiver.FrameSamples];
-                d.decode((byte[])cw.Clone(), s);
-                all.AddRange(s);
-            }
-            return all.ToArray();
-        }
+        private static bool SameCodewords(List<byte[]> got, List<byte[]> expected) =>
+            got.Count == expected.Count && got.Zip(expected).All(p => p.First.SequenceEqual(p.Second));
+
+        private static double Rms(List<short> samples) =>
+            samples.Count == 0 ? 0 : Math.Sqrt(samples.Sum(v => (double)v * v) / samples.Count);
 
         /// <summary>
         /// Builds the LDU1/LDU2 frames of a call the way a radio would send it: when encrypted, each
