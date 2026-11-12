@@ -54,7 +54,8 @@ namespace dvmcli
             // pw-cat needs --playback; pw-play is pw-cat in playback mode already
             if (Path.GetFileName(Command) == "pw-cat")
                 psi.ArgumentList.Add("--playback");
-            foreach (string arg in new[] { "--rate", SampleRate.ToString(), "--channels", "1", "--format", "s16",
+            // --raw: stdin carries bare PCM samples (without it pw-cat tries to open "-" as a sound file)
+            foreach (string arg in new[] { "--raw", "--rate", SampleRate.ToString(), "--channels", "1", "--format", "s16",
                                            "--media-role", "Communication", "-" })
                 psi.ArgumentList.Add(arg);
 
