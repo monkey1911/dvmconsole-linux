@@ -162,8 +162,13 @@ namespace dvmcli
                 : cp.Systems.FirstOrDefault(s => string.Equals(s.Name, systemName, StringComparison.OrdinalIgnoreCase))
                     ?? throw new ArgumentException($"no system named '{systemName}'");
 
-            if (channel != null && !string.IsNullOrWhiteSpace(channel.Algo) && !channel.Algo.Equals("none", StringComparison.OrdinalIgnoreCase))
-                Say($"note: '{channel.Name}' is configured for {channel.Algo}; encrypted calls will be detected and muted (clear calls play)");
+            // the channel's configured key, requested from the FNE as soon as we're logged in
+            bool channelEncrypted = channel != null && !string.IsNullOrWhiteSpace(channel.Algo) &&
+                                    !channel.Algo.Equals("none", StringComparison.OrdinalIgnoreCase);
+            byte configuredAlg = channelEncrypted ? channel.GetKeyRequestAlgoId() : (byte)0;
+            ushort configuredKeyId = channelEncrypted ? channel.GetKeyId() : (ushort)0;
+            if (channelEncrypted)
+                Say($"'{channel.Name}' uses {KeyStore.AlgorithmName(configuredAlg)} key 0x{configuredKeyId:X4}; it will be requested from the FNE");
 
             List<IAudioSink> sinks = new List<IAudioSink>();
             try
@@ -182,7 +187,8 @@ namespace dvmcli
                 if (sinks.Count == 0)
                     Say("audio: none (--no-play without --wav); showing call activity only");
 
-                using P25VoiceReceiver receiver = new P25VoiceReceiver(tg);
+                KeyStore keys = new KeyStore();
+                using P25VoiceReceiver receiver = new P25VoiceReceiver(tg, keys);
                 receiver.Status += Say;
                 receiver.Audio += samples =>
                 {
@@ -191,8 +197,13 @@ namespace dvmcli
                         sink.Write(samples);
                 };
 
-                CliPeer peer = new CliPeer(system, receiver, opt.Verbose);
+                CliPeer peer = new CliPeer(system, receiver, keys, opt.Verbose);
                 peer.Status += Say;
+
+                // a call using a key we don't hold yet asks the FNE for it
+                receiver.KeyNeeded += (alg, kid) => peer.RequestKey(alg, kid);
+                if (channelEncrypted && KeyStore.IsSupported(configuredAlg))
+                    peer.RequestKey(configuredAlg, configuredKeyId);   // queued until login completes
 
                 using ManualResetEventSlim stop = new ManualResetEventSlim(false);
                 Console.CancelKeyPress += (s, e) => { e.Cancel = true; stop.Set(); };

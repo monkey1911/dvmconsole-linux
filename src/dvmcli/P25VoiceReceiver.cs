@@ -3,9 +3,11 @@
 * dvmcli - headless Linux proof of concept for the DVM Desktop Dispatch Console.
 *
 * Follows one P25 talkgroup: tracks calls, pulls the nine IMBE codewords out of each
-* LDU1/LDU2 network frame, and decodes them to 8 kHz PCM with libvocoder.
+* LDU1/LDU2 network frame, decrypts them when the call is encrypted and the key is
+* known, and decodes them to 8 kHz PCM with libvocoder.
 */
 
+using System.Security.Cryptography;
 using dvmconsole;
 using fnecore.P25;
 
@@ -44,15 +46,36 @@ namespace dvmcli
         /// <summary>Smallest payload that holds all nine records.</summary>
         public const int MinimumPayloadLength = 154;
 
+        /// <summary>
+        /// LDU2 records 0x6D, 0x6E and 0x6F (record indexes 2-4) each carry three bytes of the next
+        /// message indicator, right after the record type byte.
+        /// </summary>
+        public static readonly int[] MiRecordIndexes = { 2, 3, 4 };
+
+        /// <summary>LDU2 record 0x70 (index 5) carries the algorithm ID and key ID after the record type byte.</summary>
+        public const int AlgRecordIndex = 5;
+
+        /// <summary>Offsets in an LDU1 network frame of the appended HDU parameters.</summary>
+        public const int HduFlagOffset = 180, HduAlgOffset = 181, HduKeyIdOffset = 182, HduMiOffset = 184, HduFrameLength = 193;
+
         private readonly uint talkgroup;
+        private readonly KeyStore keys;
         private readonly object sync = new object();
+        private readonly P25ReceiveCrypto crypto = new P25ReceiveCrypto();
         private MBEDecoder decoder;
 
         private uint streamId;
         private uint sourceId;
         private DateTime callStarted;
         private int callFrames;
-        private bool callEncrypted;
+        private int callMuted;
+
+        private byte algId;
+        private ushort keyId;
+        private readonly byte[] mi = new byte[P25Defines.P25_MI_LENGTH];
+        private bool keyRequested;
+        private bool decryptAnnounced;
+        private bool keyErrorAnnounced;
 
         /// <summary>Raised with each decoded 20 ms block of PCM.</summary>
         public event Action<short[]> Audio;
@@ -60,8 +83,14 @@ namespace dvmcli
         /// <summary>Raised with a status line for the user (call start/end, warnings).</summary>
         public event Action<string> Status;
 
+        /// <summary>Raised once per call when an encrypted call needs a key the store doesn't have.</summary>
+        public event Action<byte, ushort> KeyNeeded;
+
         /// <summary>Number of IMBE frames decoded since start.</summary>
         public long FramesDecoded { get; private set; }
+
+        /// <summary>Number of IMBE frames muted (encrypted without a usable key, or before sync).</summary>
+        public long FramesMuted { get; private set; }
 
         /// <summary>Number of calls seen on the talkgroup.</summary>
         public int CallsSeen { get; private set; }
@@ -70,9 +99,11 @@ namespace dvmcli
         /// Initializes a new instance of the <see cref="P25VoiceReceiver"/> class.
         /// </summary>
         /// <param name="talkgroup">Talkgroup ID to follow.</param>
-        public P25VoiceReceiver(uint talkgroup)
+        /// <param name="keys">Traffic key store (may be shared with the FNE peer).</param>
+        public P25VoiceReceiver(uint talkgroup, KeyStore keys = null)
         {
             this.talkgroup = talkgroup;
+            this.keys = keys ?? new KeyStore();
             decoder = new MBEDecoder(MBE_MODE.IMBE_88BIT);
         }
 
@@ -93,9 +124,7 @@ namespace dvmcli
 
             lock (sync)
             {
-                bool terminator = duid == P25DUID.TDU || duid == P25DUID.TDULC;
-
-                if (terminator)
+                if (duid == P25DUID.TDU || duid == P25DUID.TDULC)
                 {
                     if (this.streamId != 0 && streamId == this.streamId)
                         EndCall();
@@ -109,22 +138,16 @@ namespace dvmcli
                     StartCall(srcId, streamId);
                 }
 
-                // HDU parameters ride along with the first LDU1 of a call
-                if (duid == P25DUID.LDU1 && frame.Length >= 193 && frame[180] == P25Defines.P25_FT_HDU_VALID)
+                // HDU parameters ride along with an LDU1 at the start of a call
+                if (duid == P25DUID.LDU1 && frame.Length >= HduFrameLength && frame[HduFlagOffset] == P25Defines.P25_FT_HDU_VALID)
                 {
-                    byte algId = frame[181];
-                    if (algId != P25Defines.P25_ALGO_UNENCRYPT && !callEncrypted)
-                    {
-                        callEncrypted = true;
-                        ushort keyId = (ushort)((frame[182] << 8) | frame[183]);
-                        Status?.Invoke($"call from {sourceId} is encrypted (algorithm 0x{algId:X2}, key 0x{keyId:X4}); " +
-                                       "this proof of concept only decodes clear calls, so it will be muted");
-                    }
+                    algId = frame[HduAlgOffset];
+                    keyId = (ushort)((frame[HduKeyIdOffset] << 8) | frame[HduKeyIdOffset + 1]);
+                    Array.Copy(frame, HduMiOffset, mi, 0, P25Defines.P25_MI_LENGTH);
+                    Prepare();
                 }
 
                 if (duid != P25DUID.LDU1 && duid != P25DUID.LDU2)
-                    return;
-                if (callEncrypted)
                     return;
 
                 byte first = duid == P25DUID.LDU1 ? Ldu1FirstRecord : Ldu2FirstRecord;
@@ -136,13 +159,56 @@ namespace dvmcli
 
                 foreach (byte[] imbe in codewords)
                 {
+                    // decrypts in place; false = not ready (no key, or no sync yet on a late entry)
+                    if (!crypto.Process(imbe, duid))
+                    {
+                        FramesMuted++;
+                        callMuted++;
+                        continue;
+                    }
+
                     short[] samples = new short[FrameSamples];
                     decoder.decode(imbe, samples);
                     FramesDecoded++;
                     callFrames++;
                     Audio?.Invoke(samples);
                 }
+
+                // LDU2 carries the encryption sync for the next superframe
+                if (duid == P25DUID.LDU2)
+                {
+                    ReadEncryptionSync(frame, out byte nextAlg, out ushort nextKeyId, out byte[] nextMi);
+
+                    // 0x00 is not a P25 voice algorithm: keep what the HDU said, or treat the call as clear
+                    if (nextAlg == 0)
+                    {
+                        nextAlg = algId != 0 ? algId : P25Defines.P25_ALGO_UNENCRYPT;
+                        nextKeyId = keyId;
+                    }
+
+                    algId = nextAlg;
+                    keyId = nextKeyId;
+                    Array.Copy(nextMi, mi, P25Defines.P25_MI_LENGTH);
+                    Prepare();
+                }
             }
+        }
+
+        /// <summary>
+        /// Reads the algorithm ID, key ID and next message indicator from an LDU2 network frame.
+        /// </summary>
+        public static void ReadEncryptionSync(byte[] frame, out byte alg, out ushort kid, out byte[] nextMi)
+        {
+            nextMi = new byte[P25Defines.P25_MI_LENGTH];
+            for (int i = 0; i < MiRecordIndexes.Length; i++)
+            {
+                int record = PayloadOffset + RecordOffsets[MiRecordIndexes[i]];
+                Buffer.BlockCopy(frame, record + 1, nextMi, i * 3, 3);
+            }
+
+            int algRecord = PayloadOffset + RecordOffsets[AlgRecordIndex];
+            alg = frame[algRecord + 1];
+            kid = (ushort)((frame[algRecord + 2] << 8) | frame[algRecord + 3]);
         }
 
         /// <summary>
@@ -173,14 +239,71 @@ namespace dvmcli
             return true;
         }
 
+        /// <summary>
+        /// Sets up receive crypto for the current algorithm, key ID and MI.
+        /// </summary>
+        private void Prepare()
+        {
+            if (algId == 0)
+                return; // not known yet (late entry before the first LDU2)
+
+            bool encrypted = algId != P25Defines.P25_ALGO_UNENCRYPT;
+            byte[] key = null;
+
+            if (encrypted && !keys.TryGet(algId, keyId, out key))
+            {
+                crypto.Reset();
+                if (!keyRequested)
+                {
+                    keyRequested = true;
+                    Status?.Invoke($"call from {sourceId} is {KeyStore.AlgorithmName(algId)} key 0x{keyId:X4}; no key yet, " +
+                                   "requesting it from the FNE (muted until it arrives)");
+                    KeyNeeded?.Invoke(algId, keyId);
+                }
+                return;
+            }
+
+            try
+            {
+                crypto.Prepare(algId, keyId, mi, key);
+                if (encrypted && !decryptAnnounced)
+                {
+                    decryptAnnounced = true;
+                    Status?.Invoke($"decrypting {KeyStore.AlgorithmName(algId)} key 0x{keyId:X4}");
+                }
+            }
+            catch (CryptographicException)
+            {
+                crypto.Reset();
+                if (!keyErrorAnnounced)
+                {
+                    keyErrorAnnounced = true;
+                    Status?.Invoke($"the {KeyStore.AlgorithmName(algId)} key 0x{keyId:X4} could not be used; call muted");
+                }
+            }
+            finally
+            {
+                if (key != null)
+                    CryptographicOperations.ZeroMemory(key);
+            }
+        }
+
         private void StartCall(uint srcId, uint newStreamId)
         {
             streamId = newStreamId;
             sourceId = srcId;
             callStarted = DateTime.Now;
             callFrames = 0;
-            callEncrypted = false;
+            callMuted = 0;
             CallsSeen++;
+
+            crypto.Reset();
+            algId = 0;
+            keyId = 0;
+            Array.Clear(mi);
+            keyRequested = false;
+            decryptAnnounced = false;
+            keyErrorAnnounced = false;
 
             // fresh decoder state per call, as a radio would start
             decoder = new MBEDecoder(MBE_MODE.IMBE_88BIT);
@@ -191,16 +314,18 @@ namespace dvmcli
         private void EndCall()
         {
             double secs = (DateTime.Now - callStarted).TotalSeconds;
-            Status?.Invoke($"CALL END    src {sourceId}  tg {talkgroup}  {secs:F1} s, {callFrames} voice frames" +
-                           (callEncrypted ? " (encrypted, muted)" : string.Empty));
+            string crypt = algId == 0 || algId == P25Defines.P25_ALGO_UNENCRYPT ? "clear" : $"{KeyStore.AlgorithmName(algId)} key 0x{keyId:X4}";
+            string muted = callMuted > 0 ? $", {callMuted} muted" : string.Empty;
+            Status?.Invoke($"CALL END    src {sourceId}  tg {talkgroup}  {secs:F1} s, {crypt}, {callFrames} voice frames played{muted}");
             streamId = 0;
         }
 
         /// <summary>
-        /// Releases the decoder.
+        /// Releases crypto state and the decoder.
         /// </summary>
         public void Dispose()
         {
+            crypto.Reset();
             decoder = null;
         }
     } // public sealed class P25VoiceReceiver

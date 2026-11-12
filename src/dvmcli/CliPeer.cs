@@ -12,6 +12,7 @@ using fnecore;
 using fnecore.DMR;
 using fnecore.NXDN;
 using fnecore.P25;
+using fnecore.P25.KMM;
 
 namespace dvmcli
 {
@@ -21,7 +22,10 @@ namespace dvmcli
     public sealed class CliPeer : fnecore.FneSystemBase
     {
         private readonly P25VoiceReceiver receiver;
+        private readonly KeyStore keys;
         private readonly bool verbose;
+        private readonly object keyLock = new object();
+        private readonly List<(byte alg, ushort kid)> pendingKeyRequests = new List<(byte, ushort)>();
 
         /// <summary>Raised with a status line for the user.</summary>
         public event Action<string> Status;
@@ -32,10 +36,11 @@ namespace dvmcli
         /// <summary>
         /// Initializes a new instance of the <see cref="CliPeer"/> class.
         /// </summary>
-        public CliPeer(Codeplug.System system, P25VoiceReceiver receiver, bool verbose)
+        public CliPeer(Codeplug.System system, P25VoiceReceiver receiver, KeyStore keys, bool verbose)
             : base(CreatePeer(system), verbose ? LogLevel.DEBUG : LogLevel.INFO)
         {
             this.receiver = receiver;
+            this.keys = keys;
             this.verbose = verbose;
 
             fne.Logger = (LogLevel level, string message) =>
@@ -122,12 +127,74 @@ namespace dvmcli
         {
             Connected = true;
             Status?.Invoke($"connected to FNE as peer {e.PeerId}");
+
+            // send any key requests made before the login completed
+            List<(byte alg, ushort kid)> pending;
+            lock (keyLock)
+            {
+                pending = new List<(byte, ushort)>(pendingKeyRequests);
+                pendingKeyRequests.Clear();
+            }
+            foreach ((byte alg, ushort kid) in pending)
+                RequestKey(alg, kid);
+        }
+
+        /// <summary>
+        /// Asks the FNE for a traffic key. Requests made before login are queued and sent on connect.
+        /// </summary>
+        public void RequestKey(byte algId, ushort keyId)
+        {
+            if (!KeyStore.IsSupported(algId))
+            {
+                Status?.Invoke($"cannot request a key for unsupported algorithm 0x{algId:X2}");
+                return;
+            }
+
+            if (!Connected)
+            {
+                lock (keyLock)
+                {
+                    if (!pendingKeyRequests.Contains((algId, keyId)))
+                        pendingKeyRequests.Add((algId, keyId));
+                }
+                return;
+            }
+
+            try
+            {
+                fne.SendMasterKeyRequest(algId, keyId);
+                Status?.Invoke($"requested {KeyStore.AlgorithmName(algId)} key 0x{keyId:X4} from the FNE");
+            }
+            catch (Exception ex)
+            {
+                Status?.Invoke($"key request for 0x{keyId:X4} failed: {ex.Message}");
+            }
         }
 
         /// <inheritdoc/>
         protected override void KeyResponse(object sender, KeyResponseEvent e)
         {
-            Status?.Invoke("received a key response (encrypted calls are not decoded in this proof of concept)");
+            KeysetItem keyset = e?.KmmKey?.KeysetItem;
+            if (keyset?.Keys == null || keyset.Keys.Count == 0)
+            {
+                Status?.Invoke("FNE sent a key response with no keys (key not in its container, or this peer is not allowed keys)");
+                return;
+            }
+
+            foreach (KeyItem key in keyset.Keys)
+            {
+                if (key == null)
+                    continue;
+
+                byte[] material = key.GetKey();
+                bool stored = keys.Store(keyset.AlgId, key.KeyId, material);
+                if (material != null)
+                    System.Security.Cryptography.CryptographicOperations.ZeroMemory(material);
+
+                Status?.Invoke(stored
+                    ? $"received {KeyStore.AlgorithmName(keyset.AlgId)} key 0x{key.KeyId:X4} from the FNE"
+                    : $"ignored key 0x{key.KeyId:X4} with unsupported algorithm {KeyStore.AlgorithmName(keyset.AlgId)}");
+            }
         }
 
         /*

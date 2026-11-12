@@ -28,6 +28,7 @@
     <Compile Include="$(DvmConsoleSrc)VocoderToneLookupTable.cs" Link="dvmconsole\VocoderToneLookupTable.cs" />
     <Compile Include="$(DvmConsoleSrc)Log.cs" Link="dvmconsole\Log.cs" />
     <Compile Include="$(DvmConsoleSrc)AliasTools.cs" Link="dvmconsole\AliasTools.cs" />
+    <Compile Include="$(DvmConsoleSrc)P25ReceiveCrypto.cs" Link="dvmconsole\P25ReceiveCrypto.cs" />
   </ItemGroup>
 
   <ItemGroup>

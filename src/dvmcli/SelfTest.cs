@@ -4,8 +4,8 @@
 *
 * Offline self-test, run by CI on Linux ARM64. It checks that libvocoder loads, that
 * IMBE encode/decode round-trips, that the receiver pulls the nine codewords out of an
-* LDU frame and handles calls, and that codeplugs and WAV files are read/written correctly.
-* It does not touch the network.
+* LDU frame and handles calls, that encrypted calls decrypt to exactly the clear audio,
+* and that codeplugs and WAV files are read/written correctly. It does not touch the network.
 */
 
 using System.Runtime.InteropServices;
@@ -17,6 +17,10 @@ namespace dvmcli
     public static class SelfTest
     {
         private static int failures;
+
+        private const ushort TestKeyId = 0x0561;
+        private static readonly byte[] TestKey = Enumerable.Range(0, 32).Select(i => (byte)(0x10 + i * 7)).ToArray();
+        private static readonly byte[] TestMi = { 0x3A, 0x91, 0x0C, 0x5E, 0xB2, 0x47, 0xD8, 0x13, 0x00 };
 
         private static void Check(bool ok, string what)
         {
@@ -35,7 +39,7 @@ namespace dvmcli
             MBEDecoder decoder = new MBEDecoder(MBE_MODE.IMBE_88BIT);
             Check(true, "libvocoder loaded (encoder and decoder created)");
 
-            const int frames = 90;
+            const int frames = 90;                       // five superframes (LDU1 + LDU2 = 18 frames each)
             List<byte[]> codewords = new List<byte[]>();
             double outEnergy = 0;
             for (int f = 0; f < frames; f++)
@@ -55,6 +59,9 @@ namespace dvmcli
             Check(rms > 100, $"IMBE round trip produces audio (output RMS {rms:F0})");
             Check(codewords.Select(c => Convert.ToHexString(c)).Distinct().Count() > 1, "encoder output varies frame to frame");
 
+            // reference: what a fresh decoder makes of the clear codewords
+            short[] reference = DecodeAll(codewords);
+
             // 2. codeword extraction from a network LDU frame
             byte[] ldu1 = BuildLduFrame(P25VoiceReceiver.Ldu1FirstRecord, codewords.Take(9).ToList());
             byte[] ldu2 = BuildLduFrame(P25VoiceReceiver.Ldu2FirstRecord, codewords.Skip(9).Take(9).ToList());
@@ -68,50 +75,88 @@ namespace dvmcli
             Check(!P25VoiceReceiver.TryExtractCodewords(corrupt, P25VoiceReceiver.Ldu1FirstRecord, out _), "frame with a damaged record header is rejected");
             Check(!P25VoiceReceiver.TryExtractCodewords(new byte[100], P25VoiceReceiver.Ldu1FirstRecord, out _), "short frame is rejected");
 
-            // 3. call handling: one clear call on the followed talkgroup, traffic on others ignored
+            byte[] syncFrame = BuildLduFrame(P25VoiceReceiver.Ldu2FirstRecord, codewords.Skip(9).Take(9).ToList(), 0, P25Defines.P25_ALGO_AES, TestKeyId, TestMi);
+            P25VoiceReceiver.ReadEncryptionSync(syncFrame, out byte sAlg, out ushort sKid, out byte[] sMi);
+            Check(sAlg == P25Defines.P25_ALGO_AES && sKid == TestKeyId && sMi.SequenceEqual(TestMi) &&
+                  P25VoiceReceiver.TryExtractCodewords(syncFrame, P25VoiceReceiver.Ldu2FirstRecord, out byte[][] syncCw) &&
+                  Enumerable.Range(0, 9).All(i => syncCw[i].SequenceEqual(codewords[9 + i])),
+                  "LDU2 encryption sync (algorithm, key ID, MI) read back without disturbing the voice");
+
+            // 3. clear call on the followed talkgroup, traffic on others ignored
             using (P25VoiceReceiver rx = new P25VoiceReceiver(504))
             {
-                int blocks = 0;
-                double rxEnergy = 0;
+                List<short> audio = new List<short>();
                 List<string> status = new List<string>();
-                rx.Audio += s => { blocks++; foreach (short v in s) rxEnergy += (double)v * v; };
+                rx.Audio += s => audio.AddRange(s);
                 rx.Status += status.Add;
 
                 rx.Handle(999, 1234, P25DUID.LDU1, 77, ldu1);           // other talkgroup
-                Check(rx.CallsSeen == 0 && blocks == 0, "traffic on another talkgroup is ignored");
+                Check(rx.CallsSeen == 0 && audio.Count == 0, "traffic on another talkgroup is ignored");
 
-                for (int i = 0; i + 18 <= codewords.Count; i += 18)
-                {
-                    rx.Handle(504, 1234, P25DUID.LDU1, 42, BuildLduFrame(P25VoiceReceiver.Ldu1FirstRecord, codewords.Skip(i).Take(9).ToList()));
-                    rx.Handle(504, 1234, P25DUID.LDU2, 42, BuildLduFrame(P25VoiceReceiver.Ldu2FirstRecord, codewords.Skip(i + 9).Take(9).ToList()));
-                }
+                foreach ((P25DUID duid, byte[] frame) in BuildCall(codewords, P25Defines.P25_ALGO_UNENCRYPT, 0, null, withHdu: true))
+                    rx.Handle(504, 1234, duid, 42, frame);
                 rx.Handle(504, 1234, P25DUID.TDU, 42, new byte[24]);
 
-                int expected = (codewords.Count / 18) * 18;
                 Check(rx.CallsSeen == 1, "one call start detected");
-                Check(blocks == expected && rx.FramesDecoded == expected, $"{expected} voice frames decoded ({blocks} audio blocks)");
-                Check(Math.Sqrt(rxEnergy / Math.Max(1, blocks * 160)) > 100, "decoded call audio is not silent");
-                Check(status.Any(s => s.StartsWith("CALL START")) && status.Any(s => s.StartsWith("CALL END")), "call start and end reported");
+                Check(rx.FramesDecoded == frames && rx.FramesMuted == 0, $"clear call: all {frames} voice frames played");
+                Check(audio.SequenceEqual(reference), "clear call audio matches a direct decode exactly");
+                Check(status.Any(s => s.StartsWith("CALL START")) && status.Any(s => s.StartsWith("CALL END") && s.Contains("clear")), "call start and end reported");
             }
 
-            // 4. encrypted call (HDU parameters in the first LDU1) is detected and muted
-            using (P25VoiceReceiver rx = new P25VoiceReceiver(500))
+            // 4. late entry (no HDU): muted until the first LDU2 gives sync, then plays
+            using (P25VoiceReceiver rx = new P25VoiceReceiver(504))
             {
-                int blocks = 0;
-                List<string> status = new List<string>();
-                rx.Audio += _ => blocks++;
-                rx.Status += status.Add;
-
-                byte[] enc = BuildLduFrame(P25VoiceReceiver.Ldu1FirstRecord, codewords.Take(9).ToList(), 193);
-                enc[180] = P25Defines.P25_FT_HDU_VALID;
-                enc[181] = 0x84;                                      // AES-256
-                enc[182] = 0x05; enc[183] = 0x61;                     // key 0x0561
-                rx.Handle(500, 1234, P25DUID.LDU1, 9, enc);
-                rx.Handle(500, 1234, P25DUID.LDU2, 9, ldu2);
-                Check(blocks == 0 && status.Any(s => s.Contains("encrypted") && s.Contains("0x0561")), "encrypted call is detected and muted");
+                foreach ((P25DUID duid, byte[] frame) in BuildCall(codewords, P25Defines.P25_ALGO_UNENCRYPT, 0, null, withHdu: false))
+                    rx.Handle(504, 1234, duid, 43, frame);
+                Check(rx.FramesMuted == 18 && rx.FramesDecoded == frames - 18, "late-entry clear call plays from the second superframe");
             }
 
-            // 5. codeplug parsing (same settings as the console)
+            // 5. encrypted call (AES-256) with the key: decrypts to exactly the clear audio
+            KeyStore keys = new KeyStore();
+            Check(keys.Store(P25Defines.P25_ALGO_AES, TestKeyId, TestKey), "AES key stored");
+            Check(!keys.Store(0x99, 1, TestKey), "unsupported algorithm is refused");
+            using (P25VoiceReceiver rx = new P25VoiceReceiver(500, keys))
+            {
+                List<short> audio = new List<short>();
+                List<string> status = new List<string>();
+                int keyRequests = 0;
+                rx.Audio += s => audio.AddRange(s);
+                rx.Status += status.Add;
+                rx.KeyNeeded += (_, _) => keyRequests++;
+
+                List<(P25DUID, byte[])> call = BuildCall(codewords, P25Defines.P25_ALGO_AES, TestKeyId, TestKey, withHdu: true);
+                Check(!call[0].Item2.Skip(P25VoiceReceiver.PayloadOffset + 10).Take(11).SequenceEqual(codewords[0]), "test call is really encrypted on the wire");
+
+                foreach ((P25DUID duid, byte[] frame) in call)
+                    rx.Handle(500, 1234, duid, 50, frame);
+                rx.Handle(500, 1234, P25DUID.TDU, 50, new byte[24]);
+
+                Check(rx.FramesDecoded == frames && rx.FramesMuted == 0 && keyRequests == 0, $"AES call: all {frames} frames decrypted, no key request needed");
+                Check(audio.SequenceEqual(reference), "decrypted audio matches the clear audio exactly (MI cycled across 5 superframes)");
+                Check(status.Any(s => s.Contains("decrypting AES-256 key 0x0561")), "decryption reported");
+            }
+
+            // 6. encrypted call without the key: muted and the key is requested; key arriving mid-call unmutes
+            KeyStore late = new KeyStore();
+            using (P25VoiceReceiver rx = new P25VoiceReceiver(500, late))
+            {
+                List<(byte, ushort)> requested = new List<(byte, ushort)>();
+                rx.KeyNeeded += (a, k) => requested.Add((a, k));
+
+                List<(P25DUID, byte[])> call = BuildCall(codewords, P25Defines.P25_ALGO_AES, TestKeyId, TestKey, withHdu: true);
+                for (int i = 0; i < 4; i++)                          // first two superframes, no key
+                    rx.Handle(500, 1234, call[i].Item1, 51, call[i].Item2);
+                Check(rx.FramesDecoded == 0 && rx.FramesMuted == 36, "AES call without a key is muted");
+                Check(requested.Count == 1 && requested[0] == (P25Defines.P25_ALGO_AES, TestKeyId), "missing key requested once, with the right algorithm and key ID");
+
+                late.Store(P25Defines.P25_ALGO_AES, TestKeyId, TestKey); // FNE answers
+                for (int i = 4; i < call.Count; i++)
+                    rx.Handle(500, 1234, call[i].Item1, 51, call[i].Item2);
+                Check(rx.FramesDecoded > 0 && rx.FramesDecoded == frames - 36 - 18,
+                      "key arriving mid-call unmutes from the next superframe after an LDU2");
+            }
+
+            // 7. codeplug parsing (same settings as the console)
             string tmp = Path.Combine(Path.GetTempPath(), $"dvmcli-selftest-{Environment.ProcessId}");
             Directory.CreateDirectory(tmp);
             try
@@ -120,11 +165,14 @@ namespace dvmcli
                 File.WriteAllText(cpPath, SampleCodeplug);
                 Codeplug cp = Program.LoadCodeplug(cpPath);
                 Codeplug.System sys = cp.Systems.FirstOrDefault();
-                Codeplug.Channel ch = cp.Zones?.FirstOrDefault()?.Channels?.FirstOrDefault();
+                List<Codeplug.Channel> chans = cp.Zones?.FirstOrDefault()?.Channels;
+                Codeplug.Channel ch = chans?.FirstOrDefault();
+                Codeplug.Channel sec = chans?.Skip(1).FirstOrDefault();
                 Check(sys != null && sys.Name == "Test FNE" && sys.PeerId == 9000001 && sys.Port == 62031, "codeplug system parsed");
                 Check(ch != null && ch.Tgid == "504" && ch.GetChannelMode() == Codeplug.ChannelMode.P25 && ch.SelectableEncryption, "codeplug channel parsed (including dev-only keys)");
+                Check(sec != null && sec.GetKeyRequestAlgoId() == P25Defines.P25_ALGO_AES && sec.GetKeyId() == TestKeyId, "encrypted channel's algorithm and key ID read from the codeplug");
 
-                // 6. WAV writer
+                // 8. WAV writer
                 string wavPath = Path.Combine(tmp, "test.wav");
                 using (WavSink wav = new WavSink(wavPath))
                     for (int i = 0; i < 50; i++)
@@ -141,6 +189,75 @@ namespace dvmcli
 
             Console.WriteLine(failures == 0 ? "ALL TESTS PASSED" : $"{failures} TEST(S) FAILED");
             return failures == 0 ? 0 : 1;
+        }
+
+        /// <summary>
+        /// Decodes codewords with a fresh decoder, as the receiver does at the start of a call.
+        /// </summary>
+        private static short[] DecodeAll(List<byte[]> codewords)
+        {
+            MBEDecoder d = new MBEDecoder(MBE_MODE.IMBE_88BIT);
+            List<short> all = new List<short>();
+            foreach (byte[] cw in codewords)
+            {
+                short[] s = new short[P25VoiceReceiver.FrameSamples];
+                d.decode((byte[])cw.Clone(), s);
+                all.AddRange(s);
+            }
+            return all.ToArray();
+        }
+
+        /// <summary>
+        /// Builds the LDU1/LDU2 frames of a call the way a radio would send it: when encrypted, each
+        /// superframe is encrypted under the current MI, and its LDU2 carries the next MI (LFSR-cycled).
+        /// </summary>
+        private static List<(P25DUID, byte[])> BuildCall(List<byte[]> clear, byte alg, ushort kid, byte[] key, bool withHdu)
+        {
+            bool encrypted = alg != P25Defines.P25_ALGO_UNENCRYPT;
+            byte[] mi = (byte[])TestMi.Clone();
+            P25Crypto tx = null;
+            if (encrypted)
+            {
+                tx = new P25Crypto();
+                tx.SetKey(kid, alg, key);
+                tx.Prepare(alg, kid, mi);
+            }
+
+            List<(P25DUID, byte[])> frames = new List<(P25DUID, byte[])>();
+            for (int sf = 0; sf + 18 <= clear.Count; sf += 18)
+            {
+                List<byte[]> l1 = clear.Skip(sf).Take(9).Select(c => (byte[])c.Clone()).ToList();
+                List<byte[]> l2 = clear.Skip(sf + 9).Take(9).Select(c => (byte[])c.Clone()).ToList();
+                if (encrypted)
+                {
+                    foreach (byte[] c in l1) tx.Process(c, P25DUID.LDU1);
+                    foreach (byte[] c in l2) tx.Process(c, P25DUID.LDU2);
+                }
+
+                byte[] hduMi = (byte[])mi.Clone();
+                byte[] nextMi = (byte[])mi.Clone();
+                if (encrypted)
+                {
+                    P25Crypto.CycleP25Lfsr(nextMi);
+                    tx.Prepare(alg, kid, nextMi);
+                }
+
+                byte[] f1 = BuildLduFrame(P25VoiceReceiver.Ldu1FirstRecord, l1, P25VoiceReceiver.HduFrameLength);
+                if (withHdu && sf == 0)
+                {
+                    f1[P25VoiceReceiver.HduFlagOffset] = P25Defines.P25_FT_HDU_VALID;
+                    f1[P25VoiceReceiver.HduAlgOffset] = alg;
+                    f1[P25VoiceReceiver.HduKeyIdOffset] = (byte)(kid >> 8);
+                    f1[P25VoiceReceiver.HduKeyIdOffset + 1] = (byte)kid;
+                    Array.Copy(hduMi, 0, f1, P25VoiceReceiver.HduMiOffset, P25Defines.P25_MI_LENGTH);
+                }
+
+                byte[] f2 = BuildLduFrame(P25VoiceReceiver.Ldu2FirstRecord, l2, 0, alg, kid, encrypted ? nextMi : new byte[P25Defines.P25_MI_LENGTH]);
+                frames.Add((P25DUID.LDU1, f1));
+                frames.Add((P25DUID.LDU2, f2));
+                mi = nextMi;
+            }
+            return frames;
         }
 
         /// <summary>
@@ -163,8 +280,9 @@ namespace dvmcli
 
         /// <summary>
         /// Builds a network frame with nine DFSI voice records, laid out as the console's receiver expects.
+        /// For LDU2 frames, optionally fills the encryption sync (MI in records 0x6D-0x6F, algorithm and key ID in 0x70).
         /// </summary>
-        private static byte[] BuildLduFrame(byte firstRecord, List<byte[]> nine, int length = 0)
+        private static byte[] BuildLduFrame(byte firstRecord, List<byte[]> nine, int length = 0, byte alg = 0, ushort kid = 0, byte[] mi = null)
         {
             byte[] frame = new byte[Math.Max(length, P25VoiceReceiver.PayloadOffset + P25VoiceReceiver.MinimumPayloadLength + 4)];
             for (int n = 0; n < 9; n++)
@@ -172,6 +290,19 @@ namespace dvmcli
                 int record = P25VoiceReceiver.PayloadOffset + P25VoiceReceiver.RecordOffsets[n];
                 frame[record] = (byte)(firstRecord + n);
                 Buffer.BlockCopy(nine[n], 0, frame, record + P25VoiceReceiver.ImbeOffsetInRecord[n], P25VoiceReceiver.ImbeLength);
+            }
+
+            if (firstRecord == P25VoiceReceiver.Ldu2FirstRecord && alg != 0)
+            {
+                for (int i = 0; i < P25VoiceReceiver.MiRecordIndexes.Length; i++)
+                {
+                    int record = P25VoiceReceiver.PayloadOffset + P25VoiceReceiver.RecordOffsets[P25VoiceReceiver.MiRecordIndexes[i]];
+                    Buffer.BlockCopy(mi, i * 3, frame, record + 1, 3);
+                }
+                int algRecord = P25VoiceReceiver.PayloadOffset + P25VoiceReceiver.RecordOffsets[P25VoiceReceiver.AlgRecordIndex];
+                frame[algRecord + 1] = alg;
+                frame[algRecord + 2] = (byte)(kid >> 8);
+                frame[algRecord + 3] = (byte)kid;
             }
             return frame;
         }
@@ -194,6 +325,12 @@ zones:
         tgid: ""504""
         mode: ""p25""
         selectable_encryption: true
+      - name: ""Secure""
+        system: ""Test FNE""
+        tgid: ""500""
+        mode: ""p25""
+        algo: ""aes""
+        keyId: 0x561
 ";
     } // public static class SelfTest
 }
