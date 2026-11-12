@@ -233,6 +233,11 @@ namespace dvmcli
             sb.HitTest(3, 2)?.Invoke();
             Check(hit && sb.HitTest(6, 2) == null, "TUI screen: clicks map to the region under the pointer");
             Check(sb.Flush().Contains("🔒") && !sb.Flush().Contains("🔒"), "TUI screen: unchanged frames send nothing new");
+            sb.Begin(10, 1);
+            sb.Text(0, 0, "9511", Style.Plain);
+            string plain = sb.Flush();
+            Check(Style.Plain.Fg == Ansi.Default && Style.Plain.Bg == Ansi.Default && !plain.Contains("[0;30") && !plain.Contains(";40"),
+                  "TUI screen: plain text uses the terminal's default colours (not black on black)");
 
             // grid geometry
             Tui.GridGeometry g = Tui.Layout(120, 40, 10);

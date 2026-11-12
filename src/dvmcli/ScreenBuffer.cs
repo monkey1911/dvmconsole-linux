@@ -22,7 +22,8 @@ namespace dvmcli
     /// <summary>A cell style.</summary>
     public readonly record struct Style(Ansi Fg = Ansi.Default, Ansi Bg = Ansi.Default, bool Bold = false)
     {
-        public static readonly Style Plain = new Style();
+        // not new Style(): a record struct's parameterless constructor ignores the defaults above (Black on Black)
+        public static readonly Style Plain = new Style(Ansi.Default, Ansi.Default, false);
         public static Style Of(Ansi fg, Ansi bg = Ansi.Default, bool bold = false) => new Style(fg, bg, bold);
     }
 
