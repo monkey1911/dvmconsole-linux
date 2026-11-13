@@ -156,17 +156,28 @@ namespace dvmcli
         /// <summary>
         /// Encodes and queues one 20 ms block (160 samples at 8 kHz); sends an LDU every nine blocks.
         /// </summary>
-        public void PushAudio(short[] samples)
+        public void PushAudio(short[] samples) => PushFrame(samples, null);
+
+        /// <summary>
+        /// Queues one 20 ms frame: a generated tone (an IMBE tone codeword from the console's lookup table, as the
+        /// Windows console sends alert tones), or encoded audio when <paramref name="toneHz"/> is null.
+        /// </summary>
+        public void PushFrame(short[] samples, ushort? toneHz)
         {
             lock (sync)
             {
                 if (!IsTransmitting)
                     return;
-                if (samples.Length != P25VoiceReceiver.FrameSamples)
-                    throw new ArgumentException("expected 160 samples");
 
                 byte[] imbe = new byte[P25VoiceReceiver.ImbeLength];
-                encoder.encode(samples, imbe);
+                if (toneHz.HasValue)
+                    MBEToneGenerator.IMBEEncodeSingleTone(toneHz.Value, imbe);
+                else
+                {
+                    if (samples == null || samples.Length != P25VoiceReceiver.FrameSamples)
+                        throw new ArgumentException("expected 160 samples");
+                    encoder.encode(samples, imbe);
+                }
 
                 if (crypto != null)
                 {

@@ -166,6 +166,7 @@ namespace dvmcli
 
             // 7. transmit: frames built for the FNE round-trip through the receiver
             TransmitTests(codewords.Count);
+            ToneTests();
 
             // 8. codeplug parsing (same settings as the console)
             string tmp = Path.Combine(Path.GetTempPath(), $"dvmcli-selftest-{Environment.ProcessId}");
@@ -275,6 +276,11 @@ namespace dvmcli
             tui.Render(120, 40);
             tui.HandleInput(new InputEvent(InputKind.Click, X: title.IndexOf("EXIT", StringComparison.Ordinal), Y: 2));
             Check(tui.Cursor == 0 && tui.QuitRequested, "TUI keyboard focus, offline PTT refusal and EXIT button");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, '3'));    // offline: refused, no crash
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, 'c'));
+            string titleRow = tui.Render(120, 40).RowText(1);
+            Check(tui.MarkerOn && titleRow.Contains("T1") && titleRow.Contains("T5") && titleRow.Contains("MARK"),
+                  "TUI tone buttons T1-T5 and MARK in the title bar; c toggles the marker");
         }
 
         /// <summary>
@@ -376,6 +382,55 @@ namespace dvmcli
         /// <summary>
         /// Plays captured transmit frames into a receiver and returns the codewords it would decode.
         /// </summary>
+        private static void ToneTests()
+        {
+            const uint rid = 9000001;
+
+            // plans match the Windows console's built-in tones
+            TonePlan a1 = TonePlan.Alert(1), a2 = TonePlan.Alert(2), a3 = TonePlan.Alert(3), mk = TonePlan.Marker();
+            int lead = TonePlan.LeadInMs / 20;
+            Check(a1.Frames.Length % 9 == 0 && a1.Frames.Take(lead).All(f => f == null) &&
+                  a1.Frames.Skip(lead).Take(250).All(f => f == 1000) && a1.Frames.Skip(lead + 250).All(f => f == null),
+                  $"alert 1: 0.75 s silence, 5 s of 1000 Hz, 0.75 s silence ({a1.Frames.Length} frames, whole LDUs)");
+            ushort?[] body2 = a2.Frames.Skip(lead).Take(250).ToArray();
+            Check(body2.Take(12).All(f => f == 1500) && body2.Skip(13).Take(12).All(f => f == 800) && body2.All(f => f == 1500 || f == 800),
+                  "alert 2 alternates 1500 / 800 Hz every 250 ms");
+            Check(a3.Frames.Skip(lead).Take(250).Count(f => f == 1000) is >= 120 and <= 130 && a3.Frames.Skip(lead).Take(250).Contains(null),
+                  "alert 3 pulses 1000 Hz on and off");
+            Check(TonePlan.Alert(4).Frames.Contains((ushort)1000) && TonePlan.Alert(4).Frames.Contains((ushort)1500) &&
+                  TonePlan.Alert(5).Frames.Contains((ushort)940) && TonePlan.Alert(5).Frames.Contains((ushort)1640),
+                  "alerts 4 and 5 use their own frequency pairs");
+            Check(mk.Frames.Count(f => f == 650) == 25 && mk.Frames.Length % 9 == 0, "channel marker is 0.5 s of 650 Hz");
+
+            // send alert 1 on two talkgroups at once: one clear, one AES
+            Codeplug.System offline = new Codeplug.System { Name = "Test", Identity = "TEST", Address = "127.0.0.1", Port = 62031, PeerId = rid, Rid = rid.ToString(), Password = "x" };
+            CliPeer headerPeer = new CliPeer(offline, new KeyStore(), verbose: false);
+            KeyStore keys = new KeyStore();
+            keys.Store(P25Defines.P25_ALGO_AES, TestKeyId, TestKey);
+            CaptureSink clearSink = new CaptureSink(headerPeer), secureSink = new CaptureSink(headerPeer);
+            P25Transmitter clearTx = new P25Transmitter(clearSink, keys, rid, 504, P25Defines.P25_ALGO_UNENCRYPT, 0);
+            P25Transmitter secureTx = new P25Transmitter(secureSink, keys, rid, 500, P25Defines.P25_ALGO_AES, TestKeyId);
+            Check(clearTx.Start(out _) && secureTx.Start(out _), "tone transmitters start on both talkgroups");
+            int monitored = 0;
+            ToneJob job = new ToneJob(a1, new List<(string, P25Transmitter)> { ("Calling", clearTx), ("Secure", secureTx) }, _ => monitored++);
+            job.Start(realTime: false);
+
+            int ldus = a1.Frames.Length / 9;
+            Check(clearSink.Voice.Count == ldus && secureSink.Voice.Count == ldus && clearSink.Tdus.Count == 5 && secureSink.Tdus.Count == 5 &&
+                  clearSink.Voice[0].Stream != secureSink.Voice[0].Stream && monitored == a1.Frames.Length,
+                  $"alert sent as two separate calls ({ldus} LDUs each, grant and end TDUs, local monitor fed)");
+
+            byte[] toneWord = new byte[P25VoiceReceiver.ImbeLength];
+            MBEToneGenerator.IMBEEncodeSingleTone(1000, toneWord);
+            List<byte[]> clearFed = RoundTrip(clearSink, 504, rid, keys, out long m1);
+            List<byte[]> secureFed = RoundTrip(secureSink, 500, rid, keys, out long m2);
+            Check(m1 == 0 && clearFed.Count == a1.Frames.Length && clearFed.Skip(lead).Take(250).All(c => c.SequenceEqual(toneWord)),
+                  "clear alert decodes to the 1000 Hz IMBE tone codeword");
+            Check(m2 == 0 && secureFed.Count == a1.Frames.Length && secureFed.Skip(lead).Take(250).All(c => c.SequenceEqual(toneWord)) &&
+                  !secureSink.Voice[3].Frame.SequenceEqual(clearSink.Voice[3].Frame),
+                  "AES alert is encrypted on the wire and decrypts to the same tone");
+        }
+
         private static List<byte[]> RoundTrip(CaptureSink sent, uint tg, uint src, KeyStore keys, out long muted)
         {
             List<byte[]> fed = new List<byte[]>();

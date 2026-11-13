@@ -3,8 +3,9 @@
 * dvmcli - headless Linux proof of concept for the DVM Desktop Dispatch Console.
 *
 * Terminal UI: one system's channels as a grid of cards (up to four across), live
-* receive on selected channels, toggle push-to-talk, and mouse support: PTT, MUTE
-* and EXIT buttons in the title bar, click a card to listen, wheel to scroll.
+* receive on selected channels, toggle push-to-talk, alert tones 1-5 and the channel
+* marker on every listening channel, and mouse support: buttons in the title bar,
+* click a card to listen, wheel to scroll.
 */
 
 using dvmconsole;
@@ -79,6 +80,13 @@ namespace dvmcli
         private PipeWireCapture capture;
         private volatile string pendingTxStop;
 
+        // tones: alert 1-5 and the periodic channel marker, sent on every listening channel
+        private readonly TimeSpan markerInterval;
+        private volatile ToneJob toneJob;
+        private HashSet<Chan> toneChans = new HashSet<Chan>();
+        private bool markerOn;
+        private DateTime nextMarker;
+
         /// <summary>Self-test hook: don't start audio players when selecting channels.</summary>
         internal bool NoAudio { get; set; }
 
@@ -97,8 +105,9 @@ namespace dvmcli
         /// <summary>
         /// Initializes a new instance of the <see cref="Tui"/> class.
         /// </summary>
-        public Tui(Codeplug codeplug, Codeplug.System system, TimeSpan txLimit, string logFile)
+        public Tui(Codeplug codeplug, Codeplug.System system, TimeSpan txLimit, string logFile, TimeSpan? markerInterval = null)
         {
+            this.markerInterval = markerInterval ?? TimeSpan.FromSeconds(10);   // the Windows console's hold timer
             this.system = system;
             this.txLimit = txLimit;
             this.logFile = logFile;
@@ -162,6 +171,7 @@ namespace dvmcli
             finally
             {
                 term.Dispose();
+                CancelTones(wait: true);
                 StopTx("console closed");
                 foreach (Chan c in chans)
                     Deselect(c, quiet: true);
@@ -241,7 +251,7 @@ namespace dvmcli
             rx.Audio += samples =>
             {
                 PipeWireSink sink = c.Sink;
-                if (sink == null || c.Muted || globalMute || (txChan == c && tx?.IsTransmitting == true))
+                if (sink == null || c.Muted || globalMute || (txChan == c && tx?.IsTransmitting == true) || toneChans.Contains(c))
                     return;
                 Program.ApplyGain(samples, c.Gain);
                 sink.Write(samples);
@@ -323,6 +333,11 @@ namespace dvmcli
 
         private void ToggleTx()
         {
+            if (toneJob != null)
+            {
+                CancelTones();
+                return;
+            }
             if (tx != null && tx.IsTransmitting)
             {
                 StopTx(null);
@@ -412,7 +427,126 @@ namespace dvmcli
 
             if (Transmitting && DateTime.Now - tx.StartedAt > txLimit)
                 StopTx($"{txLimit.TotalSeconds:F0} s transmit limit reached");
+
+            // channel marker: a beep on every idle listening channel, every markerInterval
+            if (markerOn && DateTime.Now >= nextMarker)
+            {
+                nextMarker = DateTime.Now + markerInterval;
+                if (toneJob == null && !Transmitting && peer?.Connected == true)
+                {
+                    List<Chan> idle = TxCapableListening().Where(c => !(c.Rx?.InCall ?? false) && !c.Active).ToList();
+                    if (idle.Count > 0)
+                        SendTone(TonePlan.Marker(), idle, quiet: true);
+                }
+            }
         }
+
+        /*
+        ** Tones
+        */
+
+        private List<Chan> TxCapableListening() =>
+            chans.Where(c => c.Selected && c.IsP25 && !c.Cfg.RxOnly).ToList();
+
+        /// <summary>
+        /// Sends alert tone 1-5 on every listening channel (internal for the self-test).
+        /// </summary>
+        internal void SendAlert(int number)
+        {
+            if (toneJob != null)
+            {
+                AddLog($"a tone is already being sent ({toneJob.Plan.Name}); Esc stops it");
+                return;
+            }
+            if (Transmitting)
+            {
+                AddLog("stop transmitting before sending a tone");
+                return;
+            }
+            if (peer == null || !peer.Connected)
+            {
+                AddLog("not connected to the FNE yet");
+                return;
+            }
+
+            List<Chan> targets = TxCapableListening();
+            if (targets.Count == 0)
+            {
+                AddLog("no listening channels to send the tone on (click a card to listen)");
+                return;
+            }
+            SendTone(TonePlan.Alert(number), targets, quiet: false);
+        }
+
+        private void SendTone(TonePlan plan, List<Chan> targets, bool quiet)
+        {
+            List<(string, P25Transmitter)> started = new List<(string, P25Transmitter)>();
+            HashSet<Chan> sending = new HashSet<Chan>();
+            foreach (Chan c in targets)
+            {
+                P25Transmitter t = new P25Transmitter(peer, keys, peer.ConsoleRid, c.Tg, c.TxAlg, c.KeyId);
+                if (t.Start(out string error))
+                {
+                    started.Add((c.Cfg.Name, t));
+                    sending.Add(c);
+                }
+                else
+                {
+                    AddLog($"{c.Cfg.Name}: no {plan.Name}: {error}");
+                    if (c.Encrypted && KeyStore.IsSupported(c.KeyRequestAlg))
+                        peer.RequestKey(c.KeyRequestAlg, c.KeyId);
+                }
+            }
+            if (started.Count == 0)
+                return;
+
+            // monitor locally on one channel's speaker (not every one), unless muted
+            Chan monitorChan = sending.FirstOrDefault(c => c.Sink != null && !c.Muted);
+            Action<short[]> monitor = monitorChan == null ? null : pcm =>
+            {
+                if (!globalMute && !monitorChan.Muted)
+                    monitorChan.Sink?.Write(pcm);
+            };
+
+            ToneJob job = new ToneJob(plan, started, monitor);
+            job.Finished += j =>
+            {
+                if (!quiet || j.Cancelled)
+                    AddLog($"{plan.Name} {(j.Cancelled ? "stopped" : "sent")} on {string.Join(", ", j.Channels)}");
+                if (!quiet)
+                    foreach (string name in j.Channels)
+                        AddRecent(name, $"{peer?.ConsoleRid}", plan.Name, tx: true);
+                toneChans = new HashSet<Chan>();
+                toneJob = null;
+            };
+
+            toneChans = sending;
+            toneJob = job;
+            if (!quiet)
+                AddLog($"sending {plan.Name} on {string.Join(", ", started.Select(t => t.Item1))}");
+            job.Start();
+        }
+
+        private void CancelTones(bool wait = false)
+        {
+            ToneJob job = toneJob;
+            if (job == null)
+                return;
+            job.Cancel();
+            for (int i = 0; wait && job.Running && i < 50; i++)
+                Thread.Sleep(20);
+        }
+
+        private void ToggleMarker()
+        {
+            markerOn = !markerOn;
+            nextMarker = DateTime.Now;     // first beep straight away
+            AddLog(markerOn ? $"channel marker on: a {TonePlan.MarkerHz:F0} Hz beep every {markerInterval.TotalSeconds:F0} s on idle listening channels"
+                            : "channel marker off");
+        }
+
+        /// <summary>Channel marker on (self-test hook).</summary>
+        internal bool MarkerOn => markerOn;
 
         /*
         ** Input
@@ -460,7 +594,7 @@ namespace dvmcli
                 case InputKey.End: MoveCursor(chans.Count); break;
                 case InputKey.Enter: ToggleSelect(c); break;
                 case InputKey.Space: ToggleTx(); break;
-                case InputKey.Escape: StopTx(null); break;
+                case InputKey.Escape: StopTx(null); CancelTones(); break;
                 case InputKey.CtrlC: quit = true; break;
                 case InputKey.Char:
                     switch (e.Char)
@@ -471,6 +605,8 @@ namespace dvmcli
                         case '+': case '=': Louder(c); break;
                         case '-': case '_': Quieter(c); break;
                         case 'k': case 'K': RequestKey(c); break;
+                        case >= '1' and <= '5': SendAlert(e.Char - '0'); break;
+                        case 'c': case 'C': ToggleMarker(); break;
                     }
                     break;
             }
@@ -570,8 +706,29 @@ namespace dvmcli
         private void DrawTitle(int width)
         {
             // buttons: three rows tall so they're easy to hit
-            const int pttW = 10, muteW = 9, exitW = 8;
-            int x = width - (pttW + muteW + exitW + 2);
+            const int pttW = 10, muteW = 9, exitW = 8, toneW = 5, markW = 8;
+            bool tones = width >= 110;
+            int toneBlock = tones ? 5 * (toneW + 1) + markW + 2 : 0;
+            int x = width - (pttW + muteW + exitW + 2) - toneBlock;
+
+            if (tones)
+            {
+                ToneJob job = toneJob;
+                for (int n = 1; n <= 5; n++)
+                {
+                    int number = n;
+                    bool playing = job != null && job.Plan.Name == $"alert {n}";
+                    Button(new Rect(x, 0, toneW, TitleHeight), $"T{n}",
+                           playing ? Style.Of(Ansi.Black, Ansi.BrightRed, bold: true) : Style.Of(Ansi.Black, Ansi.BrightCyan, bold: true),
+                           () => { if (playing) CancelTones(); else SendAlert(number); });
+                    x += toneW + 1;
+                }
+                bool beeping = job != null && job.Plan.Name == "marker";
+                Button(new Rect(x, 0, markW, TitleHeight), markerOn ? "● MARK" : "MARK",
+                       beeping ? Style.Of(Ansi.Black, Ansi.BrightRed, bold: true)
+                       : markerOn ? Style.Of(Ansi.Black, Ansi.BrightYellow, bold: true) : Style.Of(Ansi.Black, Ansi.White, bold: true), ToggleMarker);
+                x += markW + 2;
+            }
 
             bool txOn = Transmitting;
             Button(new Rect(x, 0, pttW, TitleHeight), txOn ? "● TX" : "PTT",
@@ -583,7 +740,7 @@ namespace dvmcli
             Button(new Rect(x, 0, exitW, TitleHeight), "EXIT", Style.Of(Ansi.Black, Ansi.BrightMagenta, bold: true), () => quit = true);
 
             // system box
-            int boxW = width - (pttW + muteW + exitW + 3);
+            int boxW = width - (pttW + muteW + exitW + 3) - toneBlock;
             Style frame = Style.Of(Ansi.Cyan);
             screen.Box(new Rect(0, 0, boxW, TitleHeight), frame);
             screen.Text(2, 0, " dvmcli ", Style.Of(Ansi.BrightCyan, bold: true));
@@ -608,7 +765,7 @@ namespace dvmcli
         {
             Chan c = chans[idx];
             bool focused = idx == cursor;
-            bool txHere = Transmitting && txChan == c;
+            bool txHere = (Transmitting && txChan == c) || toneChans.Contains(c);
             P25VoiceReceiver rx = c.Rx;
             bool rxHere = c.Selected && rx != null && rx.InCall;
 
@@ -694,6 +851,14 @@ namespace dvmcli
 
         private void DrawStatus(Chan c, P25VoiceReceiver rx, bool txHere, bool rxHere, int x, int y, int w)
         {
+            ToneJob job = toneJob;
+            if (txHere && job != null && toneChans.Contains(c))
+            {
+                Style ts = Style.Of(Ansi.BrightWhite, Ansi.Red, bold: true);
+                screen.Fill(new Rect(x, y, w, 1), ts);
+                screen.Text(x, y, $" ♪ TX {job.Plan.Name}", ts, w);
+                return;
+            }
             if (txHere)
             {
                 TimeSpan held = DateTime.Now - tx.StartedAt;
@@ -786,7 +951,14 @@ namespace dvmcli
         private void DrawFooter(int width, int height)
         {
             int y = height - FooterHeight;
-            if (Transmitting)
+            ToneJob job = toneJob;
+            if (job != null)
+            {
+                Style s = Style.Of(Ansi.BrightWhite, Ansi.Red, bold: true);
+                screen.Fill(new Rect(0, y, width, 1), s);
+                screen.Text(1, y, $"♪ SENDING {job.Plan.Name.ToUpperInvariant()} on {string.Join(", ", job.Channels)}   (Esc, Space or the button to stop)", s, width - 2);
+            }
+            else if (Transmitting)
             {
                 TimeSpan held = DateTime.Now - tx.StartedAt;
                 Style s = Style.Of(Ansi.BrightWhite, Ansi.Red, bold: true);
@@ -801,7 +973,7 @@ namespace dvmcli
                 screen.Text(1, y, target, Style.Of(Ansi.White), width - 2);
             }
 
-            screen.Text(1, y + 1, "click card: listen  [●]: stop  arrows: move  Enter: listen  Space: PTT  m/M: mute card/all  +/-: vol  k: key  q: quit",
+            screen.Text(1, y + 1, "click card: listen  [●]: stop  arrows: move  Space: PTT  1-5: alert tone  c: marker  m/M: mute card/all  +/-: vol  k: key  q: quit",
                         Style.Of(Ansi.Grey), width - 2);
         }
 
