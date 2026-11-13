@@ -679,6 +679,7 @@ namespace dvmcli
 
             lastPageRid = d.Rid;
             MarkDirty();
+            commanded[rid] = DateTime.Now;
             radioDialog = null;
             AddLog($"radio {label.ToLowerInvariant()} sent to {rid}");
             AddRecent("radio", rid.ToString(), label.ToLowerInvariant(), tx: true);
@@ -897,22 +898,62 @@ namespace dvmcli
             SendPage(a, b);
         }
 
-        private void OnP25Control(byte lco, uint src, uint dst)
+        // radios sent a command recently (radio ID -> time), so their replies are reported
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<uint, DateTime> commanded = new();
+
+        /// <summary>
+        /// Reports control messages that concern this console (internal for the self-test). Octets of a TSBK: 0 opcode,
+        /// 1 MFID, then the arguments; for an extended function: 2-3 function, 4-6 argument, 7-9 target radio.
+        /// </summary>
+        internal void OnP25Control(byte lco, uint src, uint dst, byte[] tsbk)
         {
+            uint me = peer?.ConsoleRid ?? consoleRidForTest;
             switch (lco)
             {
                 case P25Defines.TSBK_IOSP_CALL_ALRT:
-                    AddLog($"call alert (page) from {src}");
-                    AddRecent("call alert", src.ToString(), "paged this console", tx: false);
+                    if (dst == me && me != 0)
+                    {
+                        AddLog($"call alert (page) from {src}");
+                        AddRecent("call alert", src.ToString(), "paged this console", tx: false);
+                    }
                     break;
+
                 case P25Defines.TSBK_IOSP_ACK_RSP:
-                    AddLog($"acknowledged by {src}");
+                    if (dst == me && me != 0)
+                        AddLog($"acknowledged by {src}");
                     break;
+
                 case P25Defines.TSBK_IOSP_EXT_FNCT:
-                    AddLog($"radio command response from {src}");
+                {
+                    if (tsbk == null)
+                        break;
+                    ushort fn = (ushort)(tsbk[2] << 8 | tsbk[3]);
+                    uint arg = (uint)(tsbk[4] << 16 | tsbk[5] << 8 | tsbk[6]);
+                    uint target = (uint)(tsbk[7] << 16 | tsbk[8] << 8 | tsbk[9]);
+                    string what = fn switch
+                    {
+                        (ushort)ExtendedFunction.CHECK_ACK => "answered the radio check",
+                        (ushort)ExtendedFunction.INHIBIT_ACK => "confirmed it is inhibited",
+                        (ushort)ExtendedFunction.UNINHIBIT_ACK => "confirmed it is uninhibited",
+                        _ => null
+                    };
+                    if (what == null)
+                        break;      // our own command coming back, or a function we don't report
+
+                    // a reply to us: argument is our RID (check) or the radio was commanded from here recently
+                    bool recent = commanded.TryGetValue(target, out DateTime when) && DateTime.Now - when < TimeSpan.FromMinutes(2);
+                    if ((arg == me && me != 0) || recent)
+                    {
+                        AddLog($"radio {target} {what}");
+                        AddRecent("radio", target.ToString(), what.Replace("confirmed it is ", string.Empty).Replace("answered the ", string.Empty), tx: false);
+                    }
                     break;
+                }
             }
         }
+
+        /// <summary>Console RID used by the self-test when there is no peer.</summary>
+        internal uint consoleRidForTest;
 
         private void DrawPageDialog(int width, int height)
         {

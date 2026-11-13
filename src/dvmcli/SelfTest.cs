@@ -338,6 +338,20 @@ namespace dvmcli
             tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Enter));
             dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
             Check(tui.RadioDialogOpen && dialog.Contains("not connected"), "TUI radio command refused while offline");
+            // a radio's check ack, as seen in an FNE log: tgt = the radio, arg = the console RID
+            byte[] ack = CliPeer.BuildExtendedFunction(ExtendedFunction.CHECK_ACK, 99511, 9511);
+            byte[] fecAck = new byte[P25Defines.P25_TSBK_FEC_LENGTH_BYTES];
+            new fnecore.EDAC.Trellis().Encode12(ack, ref fecAck);
+            byte[] tsduFrame = new byte[24 + P25Defines.P25_TSDU_FRAME_LENGTH_BYTES];
+            byte[] rawTsdu = new byte[P25Defines.P25_TSDU_FRAME_LENGTH_BYTES];
+            P25Interleaver.Encode(fecAck, ref rawTsdu, 114, 318);
+            Buffer.BlockCopy(rawTsdu, 0, tsduFrame, 24, rawTsdu.Length);
+            byte[] back = CliPeer.DecodeTsdu(tsduFrame);
+            Check(back != null && back.SequenceEqual(ack), "network TSDU frame decodes back to its TSBK (trellis, interleave, CRC)");
+            tui.consoleRidForTest = 99511;
+            tui.OnP25Control(P25Defines.TSBK_IOSP_EXT_FNCT, 9511, 9511, back);
+            string logRows = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
+            Check(logRows.Contains("radio 9511 answered the radio check"), "radio check ack addressed to the radio (console RID in the argument) is reported");
             tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Escape));
             Check(!tui.RadioDialogOpen && tui.Render(120, 40).RowText(1).Contains("RADIO") && tui.Render(120, 40).RowText(1).Contains("T6"),
                   "TUI title bar has T6 and RADIO");

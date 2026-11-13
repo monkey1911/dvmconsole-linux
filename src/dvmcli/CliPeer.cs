@@ -34,8 +34,12 @@ namespace dvmcli
         /// <summary>Raised on the network thread for every P25 frame from the FNE (all talkgroups).</summary>
         public event Action<P25DataReceivedEvent> P25Frame;
 
-        /// <summary>Raised for P25 control messages addressed to the console RID: (LCO, source, destination).</summary>
-        public event Action<byte, uint, uint> P25Control;
+        /// <summary>
+        /// Raised for every P25 control message (TSDU): LCO, header source and destination, and the decoded 12-byte
+        /// TSBK (null if it couldn't be decoded). The receiver decides what concerns it: a radio's reply to a radio
+        /// check is addressed to the radio, with the console RID only in the argument.
+        /// </summary>
+        public event Action<byte, uint, uint, byte[]> P25Control;
 
         /// <summary>True once the master has accepted our login.</summary>
         public bool Connected { get; private set; }
@@ -123,8 +127,8 @@ namespace dvmcli
                 // control messages (as dvmconsole reads them: the LCO is in the network header)
                 if (e.DUID == P25DUID.TSDU)
                 {
-                    if (e.Data.Length > 4 && ConsoleRid != 0 && e.DstId == ConsoleRid)
-                        P25Control?.Invoke(e.Data[4], e.SrcId, e.DstId);
+                    if (e.Data.Length > 4)
+                        P25Control?.Invoke(e.Data[4], e.SrcId, e.DstId, DecodeTsdu(e.Data));
                     return;
                 }
                 P25Frame?.Invoke(e);
@@ -233,6 +237,32 @@ namespace dvmcli
             byte[] frame = new byte[P25FrameBuilder.FrameSize];
             CreateP25MessageHdr((byte)duid, callData, ref frame, cryptoParams);
             return frame;
+        }
+
+        /// <summary>
+        /// Decodes the TSBK from a network TSDU frame (header, then the interleaved, trellis-coded TSDU, as SendP25TSBK
+        /// builds it). Returns the 12 TSBK octets, or null if the frame is short or fails the CRC.
+        /// </summary>
+        public static byte[] DecodeTsdu(byte[] frame)
+        {
+            const int offset = 24;
+            if (frame == null || frame.Length < offset + P25Defines.P25_TSDU_FRAME_LENGTH_BYTES)
+                return null;
+            try
+            {
+                byte[] raw = new byte[P25Defines.P25_TSDU_FRAME_LENGTH_BYTES];
+                Buffer.BlockCopy(frame, offset, raw, 0, raw.Length);
+                byte[] fec = new byte[P25Defines.P25_TSBK_FEC_LENGTH_BYTES];
+                P25Interleaver.Decode(raw, ref fec, 114, 318);
+                byte[] tsbk = new byte[P25Defines.P25_TSBK_LENGTH_BYTES];
+                if (!new fnecore.EDAC.Trellis().Decode12(fec, ref tsbk))
+                    return null;
+                return fnecore.EDAC.CRC.CheckCCITT162(tsbk, P25Defines.P25_TSBK_LENGTH_BYTES) ? tsbk : null;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         /// <summary>
