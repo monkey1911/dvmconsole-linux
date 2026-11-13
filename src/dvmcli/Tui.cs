@@ -568,9 +568,10 @@ namespace dvmcli
                     d.Error = "enter a radio ID (1-16777215)";
                     return;
                 }
-                if (peer == null || !peer.SendCallAlert(rid, out string error))
+                string error = "not connected to the FNE yet";
+                if (peer == null || !peer.SendCallAlert(rid, out error))
                 {
-                    d.Error = peer == null ? "not connected to the FNE yet" : error;
+                    d.Error = error;
                     return;
                 }
                 lastPageRid = d.Rid;
