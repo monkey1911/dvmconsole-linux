@@ -80,6 +80,25 @@ namespace dvmcli
             return new TonePlan($"alert {number}", c);
         }
 
+        /// <summary>QuickCall II tone A length (ms).</summary>
+        public const double PageAMs = 1000;
+
+        /// <summary>QuickCall II tone B length (ms).</summary>
+        public const double PageBMs = 3000;
+
+        /// <summary>Lowest and highest page tone accepted (the console's tone detector range).</summary>
+        public const double MinPageHz = 250, MaxPageHz = 3000;
+
+        /// <summary>
+        /// A QuickCall II two-tone page: tone A for 1 s, then tone B for 3 s (as the Windows console's manual page).
+        /// </summary>
+        public static TonePlan Page(double aHz, double bHz)
+        {
+            if (aHz < MinPageHz || aHz > MaxPageHz || bHz < MinPageHz || bHz > MaxPageHz)
+                throw new ArgumentOutOfRangeException(nameof(aHz), $"page tones must be {MinPageHz:F0}-{MaxPageHz:F0} Hz");
+            return new TonePlan($"page {aHz:0.#}/{bHz:0.#}", new List<(double, double)> { (aHz, PageAMs), (bHz, PageBMs) });
+        }
+
         /// <summary>The channel marker (the console's "channel hold" beep).</summary>
         public static TonePlan Marker() => new TonePlan("marker", new List<(double, double)> { (MarkerHz, MarkerMs) });
 
@@ -108,7 +127,7 @@ namespace dvmcli
                 short[] frame = new short[P25VoiceReceiver.FrameSamples];
                 if (hz.HasValue)
                 {
-                    double step = 2 * Math.PI * hz.Value / 8000.0;
+                    double step = 2 * Math.PI * hz.Value / 8000.0;   // frame value is rounded to 1 Hz; fine for monitoring
                     for (int i = 0; i < frame.Length; i++, phase += step)
                         frame[i] = (short)(Math.Sin(phase) * MonitorAmplitude * short.MaxValue);
                     phase %= 2 * Math.PI;

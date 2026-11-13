@@ -16,7 +16,7 @@ namespace dvmcli
     public enum InputKind { Key, Click, WheelUp, WheelDown }
 
     /// <summary>Named keys.</summary>
-    public enum InputKey { None, Up, Down, Left, Right, Enter, Space, Escape, PageUp, PageDown, Home, End, Tab, Char, CtrlC }
+    public enum InputKey { None, Up, Down, Left, Right, Enter, Space, Escape, PageUp, PageDown, Home, End, Tab, Char, CtrlC, Backspace }
 
     /// <summary>
     /// One input event. Mouse coordinates are zero-based (column, row).
@@ -68,6 +68,8 @@ namespace dvmcli
                     case 0x0A: events.Add(new InputEvent(InputKind.Key, InputKey.Enter)); break;
                     case 0x09: events.Add(new InputEvent(InputKind.Key, InputKey.Tab)); break;
                     case 0x20: events.Add(new InputEvent(InputKind.Key, InputKey.Space)); break;
+                    case 0x7F:
+                    case 0x08: events.Add(new InputEvent(InputKind.Key, InputKey.Backspace)); break;
                     default:
                         if (b >= 0x21 && b < 0x7F)
                             events.Add(new InputEvent(InputKind.Key, InputKey.Char, (char)b));

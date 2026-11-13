@@ -281,6 +281,22 @@ namespace dvmcli
             string titleRow = tui.Render(120, 40).RowText(1);
             Check(tui.MarkerOn && titleRow.Contains("T1") && titleRow.Contains("T5") && titleRow.Contains("MARK"),
                   "TUI tone buttons T1-T5 and MARK in the title bar; c toggles the marker");
+            Check(titleRow.Contains("PAGE"), "TUI PAGE button in the title bar");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, 'p'));
+            foreach (char ch in "11534") tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, ch));   // digits go to the field, not alert tones
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Backspace));
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, '.'));
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, '4'));
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Tab));
+            foreach (char ch in "99") tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, ch));
+            string dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
+            Check(tui.PageDialogOpen && dialog.Contains("QuickCall II page") && dialog.Contains("1153.4") && dialog.Contains("SEND"),
+                  "TUI page dialog opens with p and takes typed tones");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Enter));    // 99 Hz: refused, dialog stays open
+            dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
+            Check(tui.PageDialogOpen && dialog.Contains("tone B must be"), "TUI page dialog refuses an out-of-range tone");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Escape));
+            Check(!tui.PageDialogOpen, "TUI page dialog closes with Esc");
         }
 
         /// <summary>
@@ -401,6 +417,13 @@ namespace dvmcli
                   TonePlan.Alert(5).Frames.Contains((ushort)940) && TonePlan.Alert(5).Frames.Contains((ushort)1640),
                   "alerts 4 and 5 use their own frequency pairs");
             Check(mk.Frames.Count(f => f == 650) == 25 && mk.Frames.Length % 9 == 0, "channel marker is 0.5 s of 650 Hz");
+            TonePlan pg = TonePlan.Page(1153.4, 1185.2);
+            Check(pg.Frames.Take(lead).All(f => f == null) && pg.Frames.Skip(lead).Take(50).All(f => f == 1153) &&
+                  pg.Frames.Skip(lead + 50).Take(150).All(f => f == 1185) && pg.Frames.Skip(lead + 200).All(f => f == null) && pg.Frames.Length % 9 == 0,
+                  "QuickCall II page: tone A 1 s, tone B 3 s, with lead-in and tail");
+            bool rejected = false;
+            try { TonePlan.Page(100, 1000); } catch (ArgumentOutOfRangeException) { rejected = true; }
+            Check(rejected, "page tones outside 250-3000 Hz are refused");
 
             // send alert 1 on two talkgroups at once: one clear, one AES
             Codeplug.System offline = new Codeplug.System { Name = "Test", Identity = "TEST", Address = "127.0.0.1", Port = 62031, PeerId = rid, Rid = rid.ToString(), Password = "x" };

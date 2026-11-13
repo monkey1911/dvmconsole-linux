@@ -451,7 +451,14 @@ namespace dvmcli
         /// <summary>
         /// Sends alert tone 1-5 on every listening channel (internal for the self-test).
         /// </summary>
-        internal void SendAlert(int number)
+        internal void SendAlert(int number) => SendManual(TonePlan.Alert(number));
+
+        /// <summary>
+        /// Sends a QuickCall II page on every listening channel (internal for the self-test).
+        /// </summary>
+        internal void SendPage(double aHz, double bHz) => SendManual(TonePlan.Page(aHz, bHz));
+
+        private void SendManual(TonePlan plan)
         {
             if (toneJob != null)
             {
@@ -475,7 +482,141 @@ namespace dvmcli
                 AddLog("no listening channels to send the tone on (click a card to listen)");
                 return;
             }
-            SendTone(TonePlan.Alert(number), targets, quiet: false);
+            SendTone(plan, targets, quiet: false);
+        }
+
+        /*
+        ** Page dialog (QuickCall II: tone A, tone B)
+        */
+
+        private sealed class PageDialog
+        {
+            public string A = string.Empty, B = string.Empty;
+            public int Field;           // 0 = A, 1 = B
+            public string Error;
+        }
+
+        private PageDialog pageDialog;
+        private string lastPageA = string.Empty, lastPageB = string.Empty;
+
+        /// <summary>True while the page dialog is open (self-test hook).</summary>
+        internal bool PageDialogOpen => pageDialog != null;
+
+        private void OpenPage()
+        {
+            pageDialog = new PageDialog { A = lastPageA, B = lastPageB };   // last page's tones filled in
+        }
+
+        private void PageInput(InputEvent e)
+        {
+            PageDialog d = pageDialog;
+            ref string field = ref (d.Field == 0 ? ref d.A : ref d.B);
+            switch (e.Key)
+            {
+                case InputKey.Escape:
+                    pageDialog = null;
+                    break;
+                case InputKey.Tab:
+                case InputKey.Down:
+                case InputKey.Up:
+                    d.Field = 1 - d.Field;
+                    break;
+                case InputKey.Backspace:
+                    if (field.Length > 0)
+                        field = field.Substring(0, field.Length - 1);
+                    d.Error = null;
+                    break;
+                case InputKey.Enter:
+                    if (d.Field == 0 && string.IsNullOrEmpty(d.B))
+                        d.Field = 1;
+                    else
+                        SubmitPage();
+                    break;
+                case InputKey.CtrlC:
+                    quit = true;
+                    break;
+                case InputKey.Char when (char.IsDigit(e.Char) || e.Char == '.') && field.Length < 7:
+                    field += e.Char;
+                    d.Error = null;
+                    break;
+            }
+        }
+
+        private void SubmitPage()
+        {
+            PageDialog d = pageDialog;
+            if (d == null)
+                return;
+            bool okA = double.TryParse(d.A, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double a);
+            bool okB = double.TryParse(d.B, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double b);
+            if (!okA || a < TonePlan.MinPageHz || a > TonePlan.MaxPageHz)
+            {
+                d.Field = 0;
+                d.Error = $"tone A must be {TonePlan.MinPageHz:F0}-{TonePlan.MaxPageHz:F0} Hz";
+                return;
+            }
+            if (!okB || b < TonePlan.MinPageHz || b > TonePlan.MaxPageHz)
+            {
+                d.Field = 1;
+                d.Error = $"tone B must be {TonePlan.MinPageHz:F0}-{TonePlan.MaxPageHz:F0} Hz";
+                return;
+            }
+
+            lastPageA = d.A;
+            lastPageB = d.B;
+            pageDialog = null;
+            SendPage(a, b);
+        }
+
+        private void DrawPageDialog(int width, int height)
+        {
+            PageDialog d = pageDialog;
+            if (d == null)
+                return;
+
+            // swallow clicks outside the dialog
+            screen.OnClick(new Rect(0, 0, width, height), () => { });
+
+            int w = Math.Min(50, width - 4), h = 11;
+            Rect r = new Rect((width - w) / 2, Math.Max(0, (height - h) / 2), w, h);
+            Style bg = Style.Of(Ansi.BrightWhite, Ansi.Black);
+            screen.Fill(r, bg);
+            screen.Box(r, Style.Of(Ansi.BrightYellow, Ansi.Black, bold: true), heavy: true);
+            screen.Text(r.X + 2, r.Y, " QuickCall II page ", Style.Of(Ansi.BrightYellow, Ansi.Black, bold: true));
+
+            int ix = r.X + 3;
+            List<string> names = TxCapableListening().Select(c => c.Cfg.Name).ToList();
+            screen.Text(ix, r.Y + 2, names.Count > 0 ? $"on: {string.Join(", ", names)}" : "no listening channels: click a card first",
+                        names.Count > 0 ? Style.Of(Ansi.White, Ansi.Black) : Style.Of(Ansi.Yellow, Ansi.Black), w - 6);
+
+            for (int f = 0; f < 2; f++)
+            {
+                int field = f, y = r.Y + 4 + f;
+                bool active = d.Field == f;
+                string value = f == 0 ? d.A : d.B;
+                screen.Text(ix, y, f == 0 ? "Tone A (Hz)" : "Tone B (Hz)", Style.Of(active ? Ansi.BrightWhite : Ansi.White, Ansi.Black, bold: active), 12);
+                Rect box = new Rect(ix + 13, y, 12, 1);
+                Style boxStyle = active ? Style.Of(Ansi.Black, Ansi.BrightWhite, bold: true) : Style.Of(Ansi.White, Ansi.Grey);
+                screen.Fill(box, boxStyle);
+                screen.Text(box.X + 1, y, value + (active ? "▏" : string.Empty), boxStyle, box.W - 1);
+                screen.Text(box.X + box.W + 2, y, f == 0 ? "1 s" : "3 s", Style.Of(Ansi.Grey, Ansi.Black));
+                screen.OnClick(new Rect(ix, y, 30, 1), () => pageDialog.Field = field);
+            }
+
+            if (d.Error != null)
+                screen.Text(ix, r.Y + 7, d.Error, Style.Of(Ansi.BrightRed, Ansi.Black, bold: true), w - 6);
+            else
+                screen.Text(ix, r.Y + 7, "Tab: switch  Enter: send  Esc: cancel", Style.Of(Ansi.Grey, Ansi.Black), w - 6);
+
+            Rect send = new Rect(ix, r.Y + 8, 10, 1), cancel = new Rect(ix + 12, r.Y + 8, 10, 1);
+            Style sendStyle = Style.Of(Ansi.Black, Ansi.BrightYellow, bold: true);
+            screen.Fill(send, sendStyle);
+            screen.Text(send.X + 3, send.Y, "SEND", sendStyle);
+            screen.OnClick(send, SubmitPage);
+            Style cancelStyle = Style.Of(Ansi.Black, Ansi.White, bold: true);
+            screen.Fill(cancel, cancelStyle);
+            screen.Text(cancel.X + 2, cancel.Y, "CANCEL", cancelStyle);
+            screen.OnClick(cancel, () => pageDialog = null);
         }
 
         private void SendTone(TonePlan plan, List<Chan> targets, bool quiet)
@@ -557,6 +698,12 @@ namespace dvmcli
         /// </summary>
         internal void HandleInput(InputEvent e)
         {
+            if (pageDialog != null && e.Kind == InputKind.Key)
+            {
+                PageInput(e);
+                return;
+            }
+
             GridGeometry g = Layout(screen.Width, screen.Height, chans.Count);
             switch (e.Kind)
             {
@@ -607,6 +754,7 @@ namespace dvmcli
                         case 'k': case 'K': RequestKey(c); break;
                         case >= '1' and <= '5': SendAlert(e.Char - '0'); break;
                         case 'c': case 'C': ToggleMarker(); break;
+                        case 'p': case 'P': OpenPage(); break;
                     }
                     break;
             }
@@ -700,6 +848,7 @@ namespace dvmcli
                     DrawLog(new Rect(0, g.LogTop, width, g.LogHeight));
             }
             DrawFooter(width, height);
+            DrawPageDialog(width, height);
             return screen;
         }
 
@@ -708,7 +857,8 @@ namespace dvmcli
             // buttons: three rows tall so they're easy to hit
             const int pttW = 10, muteW = 9, exitW = 8, toneW = 5, markW = 8;
             bool tones = width >= 110;
-            int toneBlock = tones ? 5 * (toneW + 1) + markW + 2 : 0;
+            const int pageW = 8;
+            int toneBlock = tones ? 5 * (toneW + 1) + pageW + 1 + markW + 2 : 0;
             int x = width - (pttW + muteW + exitW + 2) - toneBlock;
 
             if (tones)
@@ -723,6 +873,12 @@ namespace dvmcli
                            () => { if (playing) CancelTones(); else SendAlert(number); });
                     x += toneW + 1;
                 }
+                bool paging = job != null && job.Plan.Name.StartsWith("page ", StringComparison.Ordinal);
+                Button(new Rect(x, 0, pageW, TitleHeight), "PAGE",
+                       paging ? Style.Of(Ansi.Black, Ansi.BrightRed, bold: true)
+                       : pageDialog != null ? Style.Of(Ansi.Black, Ansi.BrightYellow, bold: true) : Style.Of(Ansi.Black, Ansi.BrightGreen, bold: true),
+                       () => { if (paging) CancelTones(); else OpenPage(); });
+                x += pageW + 1;
                 bool beeping = job != null && job.Plan.Name == "marker";
                 Button(new Rect(x, 0, markW, TitleHeight), markerOn ? "● MARK" : "MARK",
                        beeping ? Style.Of(Ansi.Black, Ansi.BrightRed, bold: true)
@@ -973,7 +1129,7 @@ namespace dvmcli
                 screen.Text(1, y, target, Style.Of(Ansi.White), width - 2);
             }
 
-            screen.Text(1, y + 1, "click card: listen  [●]: stop  arrows: move  Space: PTT  1-5: alert tone  c: marker  m/M: mute card/all  +/-: vol  k: key  q: quit",
+            screen.Text(1, y + 1, "click card: listen  [●]: stop  arrows: move  Space: PTT  1-5: alert  p: page  c: marker  m/M: mute card/all  +/-: vol  k: key  q: quit",
                         Style.Of(Ansi.Grey), width - 2);
         }
 
