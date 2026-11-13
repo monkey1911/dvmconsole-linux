@@ -300,10 +300,12 @@ namespace dvmcli
 
             // digital page (P25 call alert)
             byte[] alert = CliPeer.BuildCallAlert(1234567, 9511);
-            fnecore.P25.LC.TSBK.IOSP_CALL_ALRT decoded = new fnecore.P25.LC.TSBK.IOSP_CALL_ALRT();
-            Check(alert.Length == P25Defines.P25_TSBK_LENGTH_BYTES && (alert[0] & 0x3F) == P25Defines.TSBK_IOSP_CALL_ALRT &&
-                  decoded.Decode(alert) && decoded.DstId == 1234567 && decoded.SrcId == 9511,
-                  "digital page: call alert TSBK encodes target and source RIDs (CRC checks on decode)");
+            // P25 layout: octet 0 opcode, 1 MFID, 2-3 reserved, 4-6 target, 7-9 source, 10-11 CRC
+            // (checked on the bytes: fnecore's TSBK Decode reads the payload one octet early)
+            Check(alert.Length == P25Defines.P25_TSBK_LENGTH_BYTES && (alert[0] & 0x3F) == P25Defines.TSBK_IOSP_CALL_ALRT && alert[1] == 0 &&
+                  alert[2] == 0 && alert[3] == 0 && (alert[4] << 16 | alert[5] << 8 | alert[6]) == 1234567 &&
+                  (alert[7] << 16 | alert[8] << 8 | alert[9]) == 9511 && fnecore.EDAC.CRC.CheckCCITT162(alert, P25Defines.P25_TSBK_LENGTH_BYTES),
+                  "digital page: call alert TSBK carries target and source RIDs with a valid CRC");
             tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, 'd'));
             foreach (char ch in "1234567") tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, ch));
             dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
