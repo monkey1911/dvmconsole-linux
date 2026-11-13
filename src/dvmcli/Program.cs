@@ -68,7 +68,7 @@ namespace dvmcli
             Console.WriteLine("  dvmcli listen   --codeplug FILE (--channel NAME | --tg TGID) [--system NAME]");
             Console.WriteLine("                  [--wav FILE] [--no-play] [--player CMD] [--verbose]");
             Console.WriteLine("  dvmcli tui      --codeplug FILE [--system NAME] [--tx-limit SECONDS] [--log FILE]");
-            Console.WriteLine("                  [--marker-interval SECONDS]");
+            Console.WriteLine("                  [--marker-interval SECONDS] [--settings FILE | --no-settings]");
             Console.WriteLine("  dvmcli selftest");
             Console.WriteLine();
             Console.WriteLine("listen follows one P25 talkgroup and plays clear calls through PipeWire (pw-play).");
@@ -252,7 +252,8 @@ namespace dvmcli
                 Console.Error.WriteLine("warning: pw-record not found; transmit won't work");
 
             string logFile = string.IsNullOrWhiteSpace(opt.LogFile) ? null : Path.GetFullPath(opt.LogFile);
-            return new Tui(cp, system, TimeSpan.FromSeconds(opt.TxLimitSeconds), logFile, TimeSpan.FromSeconds(opt.MarkerSeconds)).Run();
+            return new Tui(cp, system, TimeSpan.FromSeconds(opt.TxLimitSeconds), logFile, TimeSpan.FromSeconds(opt.MarkerSeconds),
+                           opt.NoSettings ? null : opt.SettingsFile ?? AppSettings.DefaultPath).Run();
         }
 
         /// <summary>
@@ -284,6 +285,8 @@ namespace dvmcli
             public double Gain = 1.0;
             public int TxLimitSeconds = 120;
             public int MarkerSeconds = 10;
+            public string SettingsFile;
+            public bool NoSettings;
 
             public static Options Parse(string[] args)
             {
@@ -306,6 +309,12 @@ namespace dvmcli
                         case "--no-play": o.NoPlay = true; break;
                         case "--verbose": case "-v": o.Verbose = true; break;
                         case "--log": o.LogFile = Next(); break;
+                        case "--settings":
+                            o.SettingsFile = Next();
+                            break;
+                        case "--no-settings":
+                            o.NoSettings = true;
+                            break;
                         case "--marker-interval":
                             if (!int.TryParse(Next(), out o.MarkerSeconds) || o.MarkerSeconds < 5 || o.MarkerSeconds > 600)
                                 throw new ArgumentException("--marker-interval must be between 5 and 600 seconds");

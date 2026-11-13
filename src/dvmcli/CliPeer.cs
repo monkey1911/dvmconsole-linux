@@ -270,6 +270,45 @@ namespace dvmcli
             return true;
         }
 
+        /// <summary>
+        /// Builds a P25 extended function TSBK (radio check / inhibit / uninhibit) for radio <paramref name="dstId"/>.
+        /// </summary>
+        public static byte[] BuildExtendedFunction(ExtendedFunction function, uint argument, uint dstId)
+        {
+            byte[] tsbk = new byte[P25Defines.P25_TSBK_LENGTH_BYTES];
+            new IOSP_EXT_FNCT((ushort)function, argument, dstId).Encode(ref tsbk);
+            return tsbk;
+        }
+
+        /// <summary>
+        /// Sends radio check, inhibit or uninhibit to one radio, as the Windows console does: a check carries the console
+        /// RID as its argument, inhibit and uninhibit carry the FNE's WUID.
+        /// </summary>
+        public bool SendExtendedFunction(ExtendedFunction function, uint dstId, out string error)
+        {
+            error = null;
+            if (function != ExtendedFunction.CHECK && function != ExtendedFunction.INHIBIT && function != ExtendedFunction.UNINHIBIT)
+                error = $"unsupported function {function}";
+            else if (!Connected)
+                error = "not connected to the FNE yet";
+            else if (ConsoleRid == 0)
+                error = "the system has no valid 'rid' in the codeplug";
+            else if (dstId == 0 || dstId > 0xFFFFFF)
+                error = "radio ID must be 1-16777215";
+            if (error != null)
+                return false;
+
+            uint argument = function == ExtendedFunction.CHECK ? ConsoleRid : P25Defines.WUID_FNE;
+            RemoteCallData callData = new RemoteCallData
+            {
+                SrcId = ConsoleRid,
+                DstId = dstId,
+                LCO = P25Defines.TSBK_IOSP_EXT_FNCT
+            };
+            SendP25TSBK(callData, BuildExtendedFunction(function, argument, dstId));
+            return true;
+        }
+
         /// <inheritdoc/>
         public void SendP25Voice(byte[] frame, ushort packetSequence, uint streamId)
         {

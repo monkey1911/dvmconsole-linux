@@ -80,6 +80,14 @@ namespace dvmcli
         private PipeWireCapture capture;
         private volatile string pendingTxStop;
 
+        // remembered settings
+        private readonly string settingsPath;
+        private readonly AppSettings settings;
+        private readonly string settingsError;
+        private bool settingsDirty;
+        private DateTime dirtyAt;
+        private bool talkPermit;
+
         // tones: alert 1-5 and the periodic channel marker, sent on every listening channel
         private readonly TimeSpan markerInterval;
         private volatile ToneJob toneJob;
@@ -105,8 +113,12 @@ namespace dvmcli
         /// <summary>
         /// Initializes a new instance of the <see cref="Tui"/> class.
         /// </summary>
-        public Tui(Codeplug codeplug, Codeplug.System system, TimeSpan txLimit, string logFile, TimeSpan? markerInterval = null)
+        public Tui(Codeplug codeplug, Codeplug.System system, TimeSpan txLimit, string logFile, TimeSpan? markerInterval = null,
+                   string settingsPath = null)
         {
+            this.settingsPath = settingsPath;
+            settings = AppSettings.Load(settingsPath, out settingsError);
+            talkPermit = settings.TalkPermitTone;
             this.markerInterval = markerInterval ?? TimeSpan.FromSeconds(10);   // the Windows console's hold timer
             this.system = system;
             this.txLimit = txLimit;
@@ -152,6 +164,9 @@ namespace dvmcli
             peer.P25Control += OnP25Control;
 
             AddLog($"connecting to {system.Name} ({system.Address}:{system.Port}) as peer {system.PeerId}");
+            if (settingsError != null)
+                AddLog(settingsError);
+            RestoreSettings();
             peer.Start();
 
             Terminal term = new Terminal();
@@ -173,6 +188,7 @@ namespace dvmcli
             {
                 term.Dispose();
                 CancelTones(wait: true);
+                SaveSettings();     // before the channels are closed below
                 StopTx("console closed");
                 foreach (Chan c in chans)
                     Deselect(c, quiet: true);
@@ -276,6 +292,7 @@ namespace dvmcli
             c.Active = false;
             c.Selected = true;
             AddLog($"{c.Cfg.Name}: listening (tg {c.Tg})");
+            MarkDirty();
 
             if (c.Encrypted && KeyStore.IsSupported(c.KeyRequestAlg) && !keys.TryGet(c.KeyRequestAlg, c.KeyId, out _))
                 peer?.RequestKey(c.KeyRequestAlg, c.KeyId);
@@ -296,7 +313,10 @@ namespace dvmcli
             rx?.Dispose();
             sink?.Dispose();
             if (!quiet)
+            {
                 AddLog($"{c.Cfg.Name}: stopped listening");
+                MarkDirty();
+            }
         }
 
         private void ToggleSelect(Chan c)
@@ -308,17 +328,52 @@ namespace dvmcli
         {
             c.Muted = !c.Muted;
             AddLog($"{c.Cfg.Name}: {(c.Muted ? "muted" : "unmuted")}");
+            MarkDirty();
         }
 
         private void ToggleGlobalMute()
         {
             globalMute = !globalMute;
             AddLog(globalMute ? "all receive audio muted" : "receive audio unmuted");
+            MarkDirty();
         }
 
-        private static void Louder(Chan c) => c.Gain = Math.Min(8.0, c.Gain * 1.25);
+        private void Louder(Chan c)
+        {
+            c.Gain = Math.Min(8.0, c.Gain * 1.25);
+            MarkDirty();
+        }
 
-        private static void Quieter(Chan c) => c.Gain = Math.Max(0.25, c.Gain / 1.25);
+        private void Quieter(Chan c)
+        {
+            c.Gain = Math.Max(0.25, c.Gain / 1.25);
+            MarkDirty();
+        }
+
+        private void ToggleTalkPermit()
+        {
+            talkPermit = !talkPermit;
+            AddLog(talkPermit ? "talk permit tone on" : "talk permit tone off");
+            MarkDirty();
+        }
+
+        /// <summary>Talk permit tone on (self-test hook).</summary>
+        internal bool TalkPermit => talkPermit;
+
+        /// <summary>
+        /// The Windows console's talk permit tone: 50 ms of 1200 Hz at 20 % with 10 ms fades.
+        /// </summary>
+        public static short[] TalkPermitPcm()
+        {
+            const int rate = 8000, samples = rate * 50 / 1000, fade = rate * 10 / 1000;
+            short[] pcm = new short[samples];
+            for (int i = 0; i < samples; i++)
+            {
+                double env = i < fade ? (double)i / fade : i >= samples - fade ? (double)(samples - i - 1) / fade : 1.0;
+                pcm[i] = (short)(Math.Sin(2 * Math.PI * 1200.0 * i / rate) * 0.20 * env * short.MaxValue);
+            }
+            return pcm;
+        }
 
         private void RequestKey(Chan c)
         {
@@ -389,6 +444,8 @@ namespace dvmcli
 
             tx = t;
             txChan = c;
+            if (talkPermit)
+                c.Sink?.Write(TalkPermitPcm());     // played locally once the call has started, as the Windows console does
             AddLog($"{c.Cfg.Name}: TX start as {peer.ConsoleRid}{(t.Encrypted ? $" ({KeyStore.AlgorithmName(t.AlgorithmId)} key 0x{t.KeyId:X4})" : " (clear)")}");
         }
 
@@ -429,6 +486,9 @@ namespace dvmcli
             if (Transmitting && DateTime.Now - tx.StartedAt > txLimit)
                 StopTx($"{txLimit.TotalSeconds:F0} s transmit limit reached");
 
+            if (settingsDirty && DateTime.Now - dirtyAt > TimeSpan.FromSeconds(1))
+                SaveSettings();
+
             // channel marker: a beep on every idle listening channel, every markerInterval
             if (markerOn && DateTime.Now >= nextMarker)
             {
@@ -440,6 +500,238 @@ namespace dvmcli
                         SendTone(TonePlan.Marker(), idle, quiet: true);
                 }
             }
+        }
+
+        /*
+        ** Remembered settings
+        */
+
+        private static string ChanKey(Chan c) => $"{c.Zone}/{c.Cfg.Name}/{(c.Tg != 0 ? c.Tg.ToString() : c.Cfg.Tgid)}";
+
+        private void MarkDirty()
+        {
+            settingsDirty = true;
+            dirtyAt = DateTime.Now;
+        }
+
+        /// <summary>
+        /// Applies the remembered settings for this system: listening channels, volumes, mutes, focus, last page values
+        /// (internal for the self-test). The channel marker is never switched on automatically.
+        /// </summary>
+        internal void RestoreSettings()
+        {
+            SystemSettings ss = settings.For(system.Name);
+            globalMute = ss.GlobalMute;
+            lastPageA = ss.PageA ?? string.Empty;
+            lastPageB = ss.PageB ?? string.Empty;
+            lastPageRid = ss.PageRid ?? string.Empty;
+
+            List<string> restored = new List<string>();
+            for (int i = 0; i < chans.Count; i++)
+            {
+                Chan c = chans[i];
+                string key = ChanKey(c);
+                if (key == ss.Focused)
+                    cursor = i;
+                if (!ss.Channels.TryGetValue(key, out ChannelSettings cs))
+                    continue;
+                c.Muted = cs.Muted;
+                c.Gain = Math.Clamp(cs.Gain, 0.25, 8.0);
+                if (cs.Listening && c.IsP25)
+                {
+                    Select(c);
+                    restored.Add(c.Cfg.Name);
+                }
+            }
+            if (restored.Count > 0)
+                AddLog($"restored: listening on {string.Join(", ", restored)}");
+            settingsDirty = false;
+        }
+
+        /// <summary>
+        /// Writes the current settings to the settings file (internal for the self-test).
+        /// </summary>
+        internal void SaveSettings()
+        {
+            settingsDirty = false;
+            if (settingsPath == null)
+                return;
+
+            SystemSettings ss = settings.For(system.Name);
+            settings.TalkPermitTone = talkPermit;
+            ss.GlobalMute = globalMute;
+            ss.PageA = lastPageA;
+            ss.PageB = lastPageB;
+            ss.PageRid = lastPageRid;
+            ss.Focused = ChanKey(chans[cursor]);
+            foreach (Chan c in chans)
+                ss.Channels[ChanKey(c)] = new ChannelSettings { Listening = c.Selected, Muted = c.Muted, Gain = Math.Round(c.Gain, 3) };
+
+            try { settings.Save(settingsPath); }
+            catch (Exception ex) { AddLog($"could not save settings to {settingsPath}: {ex.Message}"); }
+        }
+
+        /*
+        ** Radio commands: check, inhibit, uninhibit (one box: radio ID, action, send)
+        */
+
+        private static readonly (string Label, ExtendedFunction Function)[] RadioActions =
+        {
+            ("Check", ExtendedFunction.CHECK),
+            ("Inhibit", ExtendedFunction.INHIBIT),
+            ("Uninhibit", ExtendedFunction.UNINHIBIT)
+        };
+
+        private sealed class RadioDialog
+        {
+            public string Rid = string.Empty;
+            public int Action;          // index into RadioActions
+            public bool Confirm;        // inhibit: SEND pressed once
+            public string Error;
+        }
+
+        private RadioDialog radioDialog;
+
+        /// <summary>True while the radio command box is open (self-test hook).</summary>
+        internal bool RadioDialogOpen => radioDialog != null;
+
+        /// <summary>Selected radio action label (self-test hook).</summary>
+        internal string RadioDialogAction => radioDialog == null ? null : RadioActions[radioDialog.Action].Label;
+
+        private void OpenRadio()
+        {
+            pageDialog = null;
+            radioDialog = new RadioDialog { Rid = lastPageRid };
+        }
+
+        private void RadioInput(InputEvent e)
+        {
+            RadioDialog d = radioDialog;
+            switch (e.Key)
+            {
+                case InputKey.Escape:
+                    radioDialog = null;
+                    break;
+                case InputKey.Tab:
+                case InputKey.Right:
+                case InputKey.Down:
+                    SetRadioAction((d.Action + 1) % RadioActions.Length);
+                    break;
+                case InputKey.Left:
+                case InputKey.Up:
+                    SetRadioAction((d.Action + RadioActions.Length - 1) % RadioActions.Length);
+                    break;
+                case InputKey.Backspace:
+                    if (d.Rid.Length > 0)
+                        d.Rid = d.Rid.Substring(0, d.Rid.Length - 1);
+                    d.Error = null;
+                    d.Confirm = false;
+                    break;
+                case InputKey.Enter:
+                    SubmitRadio();
+                    break;
+                case InputKey.CtrlC:
+                    quit = true;
+                    break;
+                case InputKey.Char when char.IsDigit(e.Char) && d.Rid.Length < 8:
+                    d.Rid += e.Char;
+                    d.Error = null;
+                    d.Confirm = false;
+                    break;
+            }
+        }
+
+        private void SetRadioAction(int action)
+        {
+            if (radioDialog == null)
+                return;
+            radioDialog.Action = action;
+            radioDialog.Confirm = false;
+            radioDialog.Error = null;
+        }
+
+        private void SubmitRadio()
+        {
+            RadioDialog d = radioDialog;
+            if (d == null)
+                return;
+            (string label, ExtendedFunction fn) = RadioActions[d.Action];
+
+            if (!uint.TryParse(d.Rid, out uint rid) || rid == 0 || rid > 0xFFFFFF)
+            {
+                d.Error = "enter a radio ID (1-16777215)";
+                return;
+            }
+            if (fn == ExtendedFunction.INHIBIT && !d.Confirm)
+            {
+                d.Confirm = true;
+                d.Error = $"inhibit disables radio {rid}: press SEND again to confirm";
+                return;
+            }
+
+            string error = "not connected to the FNE yet";
+            if (peer == null || !peer.SendExtendedFunction(fn, rid, out error))
+            {
+                d.Error = error;
+                d.Confirm = false;
+                return;
+            }
+
+            lastPageRid = d.Rid;
+            MarkDirty();
+            radioDialog = null;
+            AddLog($"radio {label.ToLowerInvariant()} sent to {rid}");
+            AddRecent("radio", rid.ToString(), label.ToLowerInvariant(), tx: true);
+        }
+
+        private void DrawRadioDialog(int width, int height)
+        {
+            RadioDialog d = radioDialog;
+            if (d == null)
+                return;
+
+            screen.OnClick(new Rect(0, 0, width, height), () => { });   // swallow clicks outside
+
+            int w = Math.Min(54, width - 4), h = 11;
+            Rect r = new Rect((width - w) / 2, Math.Max(0, (height - h) / 2), w, h);
+            screen.Fill(r, Style.Of(Ansi.BrightWhite, Ansi.Black));
+            screen.Box(r, Style.Of(Ansi.BrightCyan, Ansi.Black, bold: true), heavy: true);
+            screen.Text(r.X + 2, r.Y, " Radio command ", Style.Of(Ansi.BrightCyan, Ansi.Black, bold: true));
+            int ix = r.X + 3, iw = w - 6;
+
+            DrawField(ix, r.Y + 2, "Radio ID", d.Rid, true, null, () => { });
+
+            // action choice
+            screen.Text(ix, r.Y + 4, "Action", Style.Of(Ansi.White, Ansi.Black), 12);
+            int ax = ix + 13;
+            for (int i = 0; i < RadioActions.Length; i++)
+            {
+                int index = i;
+                string label = RadioActions[i].Label;
+                bool sel = d.Action == i;
+                Style st = sel ? (RadioActions[i].Function == ExtendedFunction.INHIBIT ? Style.Of(Ansi.Black, Ansi.BrightRed, bold: true) : Style.Of(Ansi.Black, Ansi.BrightCyan, bold: true))
+                               : Style.Of(Ansi.White, Ansi.Grey);
+                Rect b = new Rect(ax, r.Y + 4, label.Length + 2, 1);
+                screen.Fill(b, st);
+                screen.Text(b.X + 1, b.Y, label, st);
+                screen.OnClick(b, () => SetRadioAction(index));
+                ax += b.W + 1;
+            }
+
+            if (d.Error != null)
+                screen.Text(ix, r.Y + 6, d.Error, Style.Of(d.Confirm ? Ansi.BrightYellow : Ansi.BrightRed, Ansi.Black, bold: true), iw);
+            else
+                screen.Text(ix, r.Y + 6, $"from RID {peer?.ConsoleRid ?? 0}   Tab/arrows: action  Enter: send  Esc: cancel", Style.Of(Ansi.Grey, Ansi.Black), iw);
+
+            Style sendStyle = d.Confirm ? Style.Of(Ansi.Black, Ansi.BrightRed, bold: true) : Style.Of(Ansi.Black, Ansi.BrightCyan, bold: true);
+            Rect send = new Rect(ix, r.Y + 8, 10, 1), cancel = new Rect(ix + 12, r.Y + 8, 10, 1);
+            screen.Fill(send, sendStyle);
+            screen.Text(send.X + 3, send.Y, "SEND", sendStyle);
+            screen.OnClick(send, SubmitRadio);
+            Style cancelStyle = Style.Of(Ansi.Black, Ansi.White, bold: true);
+            screen.Fill(cancel, cancelStyle);
+            screen.Text(cancel.X + 2, cancel.Y, "CANCEL", cancelStyle);
+            screen.OnClick(cancel, () => radioDialog = null);
         }
 
         /*
@@ -510,6 +802,7 @@ namespace dvmcli
         private void OpenPage(bool digital = false)
         {
             // the last page's values are filled in
+            radioDialog = null;
             pageDialog = new PageDialog { Digital = digital, A = lastPageA, B = lastPageB, Rid = lastPageRid };
         }
 
@@ -575,6 +868,7 @@ namespace dvmcli
                     return;
                 }
                 lastPageRid = d.Rid;
+                MarkDirty();
                 pageDialog = null;
                 AddLog($"digital page (call alert) sent to {rid}");
                 AddRecent("call alert", rid.ToString(), "digital page", tx: true);
@@ -598,6 +892,7 @@ namespace dvmcli
 
             lastPageA = d.A;
             lastPageB = d.B;
+            MarkDirty();
             pageDialog = null;
             SendPage(a, b);
         }
@@ -612,6 +907,9 @@ namespace dvmcli
                     break;
                 case P25Defines.TSBK_IOSP_ACK_RSP:
                     AddLog($"acknowledged by {src}");
+                    break;
+                case P25Defines.TSBK_IOSP_EXT_FNCT:
+                    AddLog($"radio command response from {src}");
                     break;
             }
         }
@@ -770,6 +1068,11 @@ namespace dvmcli
                 PageInput(e);
                 return;
             }
+            if (radioDialog != null && e.Kind == InputKind.Key)
+            {
+                RadioInput(e);
+                return;
+            }
 
             GridGeometry g = Layout(screen.Width, screen.Height, chans.Count);
             switch (e.Kind)
@@ -819,7 +1122,9 @@ namespace dvmcli
                         case '+': case '=': Louder(c); break;
                         case '-': case '_': Quieter(c); break;
                         case 'k': case 'K': RequestKey(c); break;
-                        case >= '1' and <= '5': SendAlert(e.Char - '0'); break;
+                        case >= '1' and <= '6': SendAlert(e.Char - '0'); break;
+                        case 'r': case 'R': OpenRadio(); break;
+                        case 't': case 'T': ToggleTalkPermit(); break;
                         case 'c': case 'C': ToggleMarker(); break;
                         case 'p': case 'P': OpenPage(); break;
                         case 'd': case 'D': OpenPage(digital: true); break;
@@ -832,12 +1137,14 @@ namespace dvmcli
         {
             cursor = Math.Clamp(cursor + delta, 0, chans.Count - 1);
             followCursor = true;
+            MarkDirty();
         }
 
         private void Focus(int index)
         {
             cursor = index;
             followCursor = true;
+            MarkDirty();
         }
 
         /*
@@ -917,22 +1224,23 @@ namespace dvmcli
             }
             DrawFooter(width, height);
             DrawPageDialog(width, height);
+            DrawRadioDialog(width, height);
             return screen;
         }
 
         private void DrawTitle(int width)
         {
             // buttons: three rows tall so they're easy to hit
-            const int pttW = 10, muteW = 9, exitW = 8, toneW = 5, markW = 8;
-            bool tones = width >= 110;
+            const int pttW = 10, muteW = 9, exitW = 8, toneW = 4, markW = 8, radioW = 9;
+            bool tones = width >= 116;
             const int pageW = 8;
-            int toneBlock = tones ? 5 * (toneW + 1) + pageW + 1 + markW + 2 : 0;
+            int toneBlock = tones ? 6 * (toneW + 1) + pageW + 1 + radioW + 1 + markW + 2 : 0;
             int x = width - (pttW + muteW + exitW + 2) - toneBlock;
 
             if (tones)
             {
                 ToneJob job = toneJob;
-                for (int n = 1; n <= 5; n++)
+                for (int n = 1; n <= 6; n++)
                 {
                     int number = n;
                     bool playing = job != null && job.Plan.Name == $"alert {n}";
@@ -947,6 +1255,9 @@ namespace dvmcli
                        : pageDialog != null ? Style.Of(Ansi.Black, Ansi.BrightYellow, bold: true) : Style.Of(Ansi.Black, Ansi.BrightGreen, bold: true),
                        () => { if (paging) CancelTones(); else OpenPage(); });
                 x += pageW + 1;
+                Button(new Rect(x, 0, radioW, TitleHeight), "RADIO",
+                       radioDialog != null ? Style.Of(Ansi.Black, Ansi.BrightYellow, bold: true) : Style.Of(Ansi.Black, Ansi.BrightCyan, bold: true), OpenRadio);
+                x += radioW + 1;
                 bool beeping = job != null && job.Plan.Name == "marker";
                 Button(new Rect(x, 0, markW, TitleHeight), markerOn ? "● MARK" : "MARK",
                        beeping ? Style.Of(Ansi.Black, Ansi.BrightRed, bold: true)
@@ -1197,7 +1508,7 @@ namespace dvmcli
                 screen.Text(1, y, target, Style.Of(Ansi.White), width - 2);
             }
 
-            screen.Text(1, y + 1, "click card: listen  [●]: stop  arrows: move  Space: PTT  1-5: alert  p/d: tone/digital page  c: marker  m/M: mute card/all  +/-: vol  k: key  q: quit",
+            screen.Text(1, y + 1, "click card: listen  [●]: stop  Space: PTT  1-6: alert  p/d: page  r: radio cmd  c: marker  t: talk permit  m/M: mute card/all  +/-: vol  k: key  q: quit",
                         Style.Of(Ansi.Grey), width - 2);
         }
 

@@ -78,8 +78,9 @@ Channels are shown as cards, up to four across. The mouse works in any terminal 
 |---|---|
 | **PTT** (title bar) | Toggle transmit on the focused card (click again to stop) |
 | **MUTE** (title bar) | Mute or unmute all receive audio |
-| **T1**–**T5** (title bar) | Send alert tone 1–5 on every listening channel (click again to stop) |
+| **T1**–**T6** (title bar) | Send alert tone 1–6 on every listening channel (click again to stop) |
 | **PAGE** (title bar) | Page: a QuickCall II tone page on the listening channels, or a digital page (P25 call alert) to one radio ID |
+| **RADIO** (title bar) | Radio command: enter a radio ID, pick Check, Inhibit or Uninhibit, then SEND |
 | **MARK** (title bar) | Turn the channel marker on or off |
 | **EXIT** (title bar) | Quit |
 | A card | Focus it and start listening |
@@ -93,7 +94,9 @@ Channels are shown as cards, up to four across. The mouse works in any terminal 
 | Enter | Start or stop listening on the focused card |
 | Space | Toggle transmit on the focused card (press again to stop) |
 | Esc | Stop transmitting or stop a tone |
-| 1 – 5 | Send alert tone 1–5 on every listening channel |
+| 1 – 6 | Send alert tone 1–6 on every listening channel |
+| r | Radio command box (Tab or arrows pick the action, Enter sends) |
+| t | Talk permit tone on or off |
 | p / d | Open the page box in tone or digital mode (←/→ switch modes, Tab switches tone A / B, Enter sends, Esc cancels) |
 | c | Turn the channel marker on or off |
 | m / M | Mute the focused card / mute everything |
@@ -101,7 +104,13 @@ Channels are shown as cards, up to four across. The mouse works in any terminal 
 | k | Request the focused card's key from the FNE again |
 | q or Ctrl+C | Quit |
 
-Alert tones match the Windows console's built-in tones 1–5 (5 seconds each). A digital page is a P25 call alert from the console's RID to one radio (the Windows console's "Page Subscriber"); call alerts and acknowledgements addressed to the console's RID are logged when the FNE passes them on. A QuickCall II page is tone A for 1 s then tone B for 3 s (250–3000 Hz, as the Windows console's manual page), sent on every listening channel; the last page's tones are filled in next time. On P25, tones travel as IMBE tone frames, which carry the frequency in steps of about 31 Hz, so radios regenerate the nearest step. The channel marker is the console's "channel hold" beep: 0.5 s of 650 Hz every 10 seconds on each listening channel that isn't busy; change the interval with `--marker-interval SECONDS`. Tones are encrypted on secure channels and skipped on channels whose key isn't held. The tone buttons are hidden on terminals narrower than 110 columns; the keys still work.
+Alert tones match the Windows console's built-in tones 1–6 (5 seconds each). A digital page is a P25 call alert from the console's RID to one radio (the Windows console's "Page Subscriber"); call alerts and acknowledgements addressed to the console's RID are logged when the FNE passes them on. A QuickCall II page is tone A for 1 s then tone B for 3 s (250–3000 Hz, as the Windows console's manual page), sent on every listening channel; the last page's tones are filled in next time. On P25, tones travel as IMBE tone frames, which carry the frequency in steps of about 31 Hz, so radios regenerate the nearest step. The channel marker is the console's "channel hold" beep: 0.5 s of 650 Hz every 10 seconds on each listening channel that isn't busy; change the interval with `--marker-interval SECONDS`. Tones are encrypted on secure channels and skipped on channels whose key isn't held. The tone buttons are hidden on terminals narrower than 110 columns; the keys still work.
+
+Radio check, inhibit and uninhibit are sent as in the Windows console. Inhibit disables the radio, so it asks you to press SEND a second time.
+
+The talk permit tone (a short 1200 Hz beep when transmit starts) is on by default; `t` turns it off.
+
+Settings are remembered per system in `~/.config/dvmcli/settings.json`: which channels you're listening to, the focused card, volumes, mutes, global mute, the talk permit tone and the last page / radio values. Use `--settings FILE` for a different file or `--no-settings` to start fresh without saving. The channel marker always starts off. The file holds no passwords or keys.
 
 Transmit uses the default PipeWire microphone and the system's `rid` as the source ID. A secure channel never transmits in the clear: without its key, transmit is refused. Transmissions stop automatically after 120 seconds; change that with `--tx-limit SECONDS`. Add `--log FILE` to keep a copy of the log.
 

@@ -2,7 +2,7 @@
 /**
 * dvmcli - headless Linux proof of concept for the DVM Desktop Dispatch Console.
 *
-* Alert tones 1-5 and the channel marker, matching the Windows console's built-in
+* Alert tones 1-6, QuickCall II pages and the channel marker, matching the Windows console's built-in
 * tones (MainWindow.BuildLegacyAlertTonePayload / BuildChannelHoldTonePayload), and a
 * job that transmits one of them on several talkgroups at once in real time.
 */
@@ -64,7 +64,7 @@ namespace dvmcli
             }
         }
 
-        /// <summary>Alert tone 1-5.</summary>
+        /// <summary>Alert tone 1-6.</summary>
         public static TonePlan Alert(int number)
         {
             List<(double, double)> c = new List<(double, double)>();
@@ -75,7 +75,8 @@ namespace dvmcli
                 case 3: Pulse(c, 1000, StepMs); break;
                 case 4: Alternate(c, 1500, 1000, FastStepMs); break;
                 case 5: Alternate(c, 940, 1640, StepMs); break;
-                default: throw new ArgumentOutOfRangeException(nameof(number), "alert tones are 1 to 5");
+                case 6: Alternate(c, 460, 860, FastStepMs); break;     // warble
+                default: throw new ArgumentOutOfRangeException(nameof(number), "alert tones are 1 to 6");
             }
             return new TonePlan($"alert {number}", c);
         }

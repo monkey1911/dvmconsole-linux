@@ -317,6 +317,55 @@ namespace dvmcli
             tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Left));
             Check(!tui.PageDialogDigital, "TUI arrows switch the page dialog between tone and digital");
             tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Escape));
+
+            // radio check / inhibit / uninhibit
+            byte[] check = CliPeer.BuildExtendedFunction(ExtendedFunction.CHECK, 9511, 1234567);
+            byte[] inhibit = CliPeer.BuildExtendedFunction(ExtendedFunction.INHIBIT, P25Defines.WUID_FNE, 1234567);
+            Check((check[0] & 0x3F) == P25Defines.TSBK_IOSP_EXT_FNCT && check[2] == 0x00 && check[3] == 0x00 &&
+                  (check[4] << 16 | check[5] << 8 | check[6]) == 9511 && (check[7] << 16 | check[8] << 8 | check[9]) == 1234567 &&
+                  inhibit[3] == 0x7F && (inhibit[4] << 16 | inhibit[5] << 8 | inhibit[6]) == P25Defines.WUID_FNE &&
+                  fnecore.EDAC.CRC.CheckCCITT162(check, P25Defines.P25_TSBK_LENGTH_BYTES) && fnecore.EDAC.CRC.CheckCCITT162(inhibit, P25Defines.P25_TSBK_LENGTH_BYTES),
+                  "radio check / inhibit TSBKs carry function, argument and target with valid CRCs");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, 'r'));
+            foreach (char ch in "7654321") tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, ch));
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Tab));
+            dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
+            Check(tui.RadioDialogOpen && tui.RadioDialogAction == "Inhibit" && dialog.Contains("Radio command") && dialog.Contains("7654321") &&
+                  dialog.Contains("Uninhibit"), "TUI r opens the radio command box: radio ID, then Check / Inhibit / Uninhibit");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Enter));
+            dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
+            Check(tui.RadioDialogOpen && dialog.Contains("press SEND again"), "TUI inhibit asks for confirmation first");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Enter));
+            dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
+            Check(tui.RadioDialogOpen && dialog.Contains("not connected"), "TUI radio command refused while offline");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Escape));
+            Check(!tui.RadioDialogOpen && tui.Render(120, 40).RowText(1).Contains("RADIO") && tui.Render(120, 40).RowText(1).Contains("T6"),
+                  "TUI title bar has T6 and RADIO");
+
+            // remembered settings
+            string settingsFile = Path.Combine(Path.GetTempPath(), $"dvmcli-settings-{Environment.ProcessId}.json");
+            try
+            {
+                Tui first = new Tui(cp, sys, TimeSpan.FromSeconds(120), null, settingsPath: settingsFile) { NoAudio = true };
+                first.Render(120, 40);
+                first.HandleInput(new InputEvent(InputKind.Key, InputKey.Right));      // focus Secure
+                first.HandleInput(new InputEvent(InputKind.Key, InputKey.Enter));      // listen
+                first.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, 'm'));  // mute it
+                first.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, '+'));
+                first.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, 't'));  // talk permit off
+                first.SaveSettings();
+                string json = File.ReadAllText(settingsFile);
+
+                Tui second = new Tui(cp, sys, TimeSpan.FromSeconds(120), null, settingsPath: settingsFile) { NoAudio = true };
+                second.RestoreSettings();
+                Check(second.Cursor == 1 && second.IsSelected(1) && !second.IsSelected(0) && !second.TalkPermit && json.Contains("1.25") &&
+                      !json.Contains("password", StringComparison.OrdinalIgnoreCase),
+                      "settings remembered: listening channels, focus, volume, mute, talk permit (no passwords in the file)");
+            }
+            finally
+            {
+                try { File.Delete(settingsFile); } catch { /* ignore */ }
+            }
         }
 
         /// <summary>
@@ -437,6 +486,11 @@ namespace dvmcli
                   TonePlan.Alert(5).Frames.Contains((ushort)940) && TonePlan.Alert(5).Frames.Contains((ushort)1640),
                   "alerts 4 and 5 use their own frequency pairs");
             Check(mk.Frames.Count(f => f == 650) == 25 && mk.Frames.Length % 9 == 0, "channel marker is 0.5 s of 650 Hz");
+            ushort?[] body6 = TonePlan.Alert(6).Frames.Skip(lead).Take(250).ToArray();
+            Check(body6.Take(6).All(f => f == 460) && body6.Skip(7).Take(5).All(f => f == 860) && body6.All(f => f == 460 || f == 860),
+                  "alert 6 warbles 460 / 860 Hz every 125 ms");
+            short[] tpt = Tui.TalkPermitPcm();
+            Check(tpt.Length == 400 && tpt[0] == 0 && tpt.Max() > 6000 && tpt.Max() < 6600, "talk permit tone: 50 ms of 1200 Hz at 20 % with fades");
             TonePlan pg = TonePlan.Page(1153.4, 1185.2);
             Check(pg.Frames.Take(lead).All(f => f == null) && pg.Frames.Skip(lead).Take(50).All(f => f == 1153) &&
                   pg.Frames.Skip(lead + 50).Take(150).All(f => f == 1185) && pg.Frames.Skip(lead + 200).All(f => f == null) && pg.Frames.Length % 9 == 0,
