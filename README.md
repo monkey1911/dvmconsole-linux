@@ -78,6 +78,8 @@ Channels are shown as cards, up to four across. The mouse works in any terminal 
 |---|---|
 | **PTT** (title bar) | Toggle transmit on the focused card (click again to stop) |
 | **MUTE** (title bar) | Mute or unmute all receive audio |
+| **T1**–**T5** (title bar) | Send alert tone 1–5 on every listening channel (click again to stop) |
+| **MARK** (title bar) | Turn the channel marker on or off |
 | **EXIT** (title bar) | Quit |
 | A card | Focus it and start listening |
 | `[●]` on a card | Stop listening |
@@ -89,11 +91,15 @@ Channels are shown as cards, up to four across. The mouse works in any terminal 
 | Arrows, Tab, PgUp / PgDn, Home / End | Move between cards |
 | Enter | Start or stop listening on the focused card |
 | Space | Toggle transmit on the focused card (press again to stop) |
-| Esc | Stop transmitting |
+| Esc | Stop transmitting or stop a tone |
+| 1 – 5 | Send alert tone 1–5 on every listening channel |
+| c | Turn the channel marker on or off |
 | m / M | Mute the focused card / mute everything |
 | + / - | Volume of the focused card |
 | k | Request the focused card's key from the FNE again |
 | q or Ctrl+C | Quit |
+
+Alert tones match the Windows console's built-in tones 1–5 (5 seconds each). The channel marker is the console's "channel hold" beep: 0.5 s of 650 Hz every 10 seconds on each listening channel that isn't busy; change the interval with `--marker-interval SECONDS`. Tones are encrypted on secure channels and skipped on channels whose key isn't held. The tone buttons are hidden on terminals narrower than 110 columns; the keys still work.
 
 Transmit uses the default PipeWire microphone and the system's `rid` as the source ID. A secure channel never transmits in the clear: without its key, transmit is refused. Transmissions stop automatically after 120 seconds; change that with `--tx-limit SECONDS`. Add `--log FILE` to keep a copy of the log.
 
