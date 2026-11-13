@@ -665,7 +665,7 @@ namespace dvmcli
             if (fn == ExtendedFunction.INHIBIT && !d.Confirm)
             {
                 d.Confirm = true;
-                d.Error = $"inhibit disables radio {rid}: press SEND again to confirm";
+                d.Error = $"press SEND again to inhibit {rid}";
                 return;
             }
 
