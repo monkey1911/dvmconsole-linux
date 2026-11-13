@@ -13,6 +13,7 @@ using fnecore.DMR;
 using fnecore.NXDN;
 using fnecore.P25;
 using fnecore.P25.KMM;
+using fnecore.P25.LC.TSBK;
 
 namespace dvmcli
 {
@@ -32,6 +33,9 @@ namespace dvmcli
 
         /// <summary>Raised on the network thread for every P25 frame from the FNE (all talkgroups).</summary>
         public event Action<P25DataReceivedEvent> P25Frame;
+
+        /// <summary>Raised for P25 control messages addressed to the console RID: (LCO, source, destination).</summary>
+        public event Action<byte, uint, uint> P25Control;
 
         /// <summary>True once the master has accepted our login.</summary>
         public bool Connected { get; private set; }
@@ -115,6 +119,14 @@ namespace dvmcli
             {
                 if (verbose)
                     Status?.Invoke($"p25 {e.DUID} src {e.SrcId} tg {e.DstId} stream {e.StreamId} ({e.Data.Length} bytes)");
+
+                // control messages (as dvmconsole reads them: the LCO is in the network header)
+                if (e.DUID == P25DUID.TSDU)
+                {
+                    if (e.Data.Length > 4 && ConsoleRid != 0 && e.DstId == ConsoleRid)
+                        P25Control?.Invoke(e.Data[4], e.SrcId, e.DstId);
+                    return;
+                }
                 P25Frame?.Invoke(e);
             }
             catch (Exception ex)
@@ -221,6 +233,41 @@ namespace dvmcli
             byte[] frame = new byte[P25FrameBuilder.FrameSize];
             CreateP25MessageHdr((byte)duid, callData, ref frame, cryptoParams);
             return frame;
+        }
+
+        /// <summary>
+        /// Builds a P25 call alert (digital page) TSBK from <paramref name="srcId"/> to radio <paramref name="dstId"/>.
+        /// </summary>
+        public static byte[] BuildCallAlert(uint dstId, uint srcId)
+        {
+            byte[] tsbk = new byte[P25Defines.P25_TSBK_LENGTH_BYTES];
+            new IOSP_CALL_ALRT(dstId, srcId).Encode(ref tsbk);
+            return tsbk;
+        }
+
+        /// <summary>
+        /// Sends a P25 call alert ("Page Subscriber" in the Windows console) to one radio, from the console RID.
+        /// </summary>
+        public bool SendCallAlert(uint dstId, out string error)
+        {
+            error = null;
+            if (!Connected)
+                error = "not connected to the FNE yet";
+            else if (ConsoleRid == 0)
+                error = "the system has no valid 'rid' in the codeplug";
+            else if (dstId == 0 || dstId > 0xFFFFFF)
+                error = "radio ID must be 1-16777215";
+            if (error != null)
+                return false;
+
+            RemoteCallData callData = new RemoteCallData
+            {
+                SrcId = ConsoleRid,
+                DstId = dstId,
+                LCO = P25Defines.TSBK_IOSP_CALL_ALRT
+            };
+            SendP25TSBK(callData, BuildCallAlert(dstId, ConsoleRid));
+            return true;
         }
 
         /// <inheritdoc/>

@@ -149,6 +149,7 @@ namespace dvmcli
             peer = new CliPeer(system, keys, verbose: false);
             peer.Status += AddLog;
             peer.P25Frame += OnFrame;
+            peer.P25Control += OnP25Control;
 
             AddLog($"connecting to {system.Name} ({system.Address}:{system.Port}) as peer {system.PeerId}");
             peer.Start();
@@ -486,40 +487,51 @@ namespace dvmcli
         }
 
         /*
-        ** Page dialog (QuickCall II: tone A, tone B)
+        ** Page dialog: QuickCall II tone page (on listening channels) or digital page (P25 call alert to one radio)
         */
 
         private sealed class PageDialog
         {
-            public string A = string.Empty, B = string.Empty;
-            public int Field;           // 0 = A, 1 = B
+            public bool Digital;
+            public string A = string.Empty, B = string.Empty, Rid = string.Empty;
+            public int Field;           // tone mode: 0 = A, 1 = B
             public string Error;
         }
 
         private PageDialog pageDialog;
-        private string lastPageA = string.Empty, lastPageB = string.Empty;
+        private string lastPageA = string.Empty, lastPageB = string.Empty, lastPageRid = string.Empty;
 
         /// <summary>True while the page dialog is open (self-test hook).</summary>
         internal bool PageDialogOpen => pageDialog != null;
 
-        private void OpenPage()
+        /// <summary>True when the open page dialog is in digital (call alert) mode (self-test hook).</summary>
+        internal bool PageDialogDigital => pageDialog?.Digital == true;
+
+        private void OpenPage(bool digital = false)
         {
-            pageDialog = new PageDialog { A = lastPageA, B = lastPageB };   // last page's tones filled in
+            // the last page's values are filled in
+            pageDialog = new PageDialog { Digital = digital, A = lastPageA, B = lastPageB, Rid = lastPageRid };
         }
 
         private void PageInput(InputEvent e)
         {
             PageDialog d = pageDialog;
-            ref string field = ref (d.Field == 0 ? ref d.A : ref d.B);
+            ref string field = ref (d.Digital ? ref d.Rid : ref (d.Field == 0 ? ref d.A : ref d.B));
             switch (e.Key)
             {
                 case InputKey.Escape:
                     pageDialog = null;
                     break;
+                case InputKey.Left:
+                case InputKey.Right:
+                    d.Digital = !d.Digital;
+                    d.Error = null;
+                    break;
                 case InputKey.Tab:
                 case InputKey.Down:
                 case InputKey.Up:
-                    d.Field = 1 - d.Field;
+                    if (!d.Digital)
+                        d.Field = 1 - d.Field;
                     break;
                 case InputKey.Backspace:
                     if (field.Length > 0)
@@ -527,7 +539,7 @@ namespace dvmcli
                     d.Error = null;
                     break;
                 case InputKey.Enter:
-                    if (d.Field == 0 && string.IsNullOrEmpty(d.B))
+                    if (!d.Digital && d.Field == 0 && string.IsNullOrEmpty(d.B))
                         d.Field = 1;
                     else
                         SubmitPage();
@@ -535,7 +547,8 @@ namespace dvmcli
                 case InputKey.CtrlC:
                     quit = true;
                     break;
-                case InputKey.Char when (char.IsDigit(e.Char) || e.Char == '.') && field.Length < 7:
+                case InputKey.Char when char.IsDigit(e.Char) && field.Length < (d.Digital ? 8 : 7):
+                case InputKey.Char when e.Char == '.' && !d.Digital && field.Length < 7:
                     field += e.Char;
                     d.Error = null;
                     break;
@@ -547,6 +560,26 @@ namespace dvmcli
             PageDialog d = pageDialog;
             if (d == null)
                 return;
+
+            if (d.Digital)
+            {
+                if (!uint.TryParse(d.Rid, out uint rid) || rid == 0 || rid > 0xFFFFFF)
+                {
+                    d.Error = "enter a radio ID (1-16777215)";
+                    return;
+                }
+                if (peer == null || !peer.SendCallAlert(rid, out string error))
+                {
+                    d.Error = peer == null ? "not connected to the FNE yet" : error;
+                    return;
+                }
+                lastPageRid = d.Rid;
+                pageDialog = null;
+                AddLog($"digital page (call alert) sent to {rid}");
+                AddRecent("call alert", rid.ToString(), "digital page", tx: true);
+                return;
+            }
+
             bool okA = double.TryParse(d.A, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double a);
             bool okB = double.TryParse(d.B, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double b);
             if (!okA || a < TonePlan.MinPageHz || a > TonePlan.MaxPageHz)
@@ -568,6 +601,20 @@ namespace dvmcli
             SendPage(a, b);
         }
 
+        private void OnP25Control(byte lco, uint src, uint dst)
+        {
+            switch (lco)
+            {
+                case P25Defines.TSBK_IOSP_CALL_ALRT:
+                    AddLog($"call alert (page) from {src}");
+                    AddRecent("call alert", src.ToString(), "paged this console", tx: false);
+                    break;
+                case P25Defines.TSBK_IOSP_ACK_RSP:
+                    AddLog($"acknowledged by {src}");
+                    break;
+            }
+        }
+
         private void DrawPageDialog(int width, int height)
         {
             PageDialog d = pageDialog;
@@ -577,46 +624,65 @@ namespace dvmcli
             // swallow clicks outside the dialog
             screen.OnClick(new Rect(0, 0, width, height), () => { });
 
-            int w = Math.Min(50, width - 4), h = 11;
+            int w = Math.Min(54, width - 4), h = 12;
             Rect r = new Rect((width - w) / 2, Math.Max(0, (height - h) / 2), w, h);
             Style bg = Style.Of(Ansi.BrightWhite, Ansi.Black);
             screen.Fill(r, bg);
             screen.Box(r, Style.Of(Ansi.BrightYellow, Ansi.Black, bold: true), heavy: true);
-            screen.Text(r.X + 2, r.Y, " QuickCall II page ", Style.Of(Ansi.BrightYellow, Ansi.Black, bold: true));
+            screen.Text(r.X + 2, r.Y, " Page ", Style.Of(Ansi.BrightYellow, Ansi.Black, bold: true));
+            int ix = r.X + 3, iw = w - 6;
 
-            int ix = r.X + 3;
-            List<string> names = TxCapableListening().Select(c => c.Cfg.Name).ToList();
-            screen.Text(ix, r.Y + 2, names.Count > 0 ? $"on: {string.Join(", ", names)}" : "no listening channels: click a card first",
-                        names.Count > 0 ? Style.Of(Ansi.White, Ansi.Black) : Style.Of(Ansi.Yellow, Ansi.Black), w - 6);
+            // mode tabs
+            Style on = Style.Of(Ansi.Black, Ansi.BrightYellow, bold: true), off = Style.Of(Ansi.White, Ansi.Grey);
+            Rect toneTab = new Rect(ix, r.Y + 2, 16, 1), digTab = new Rect(ix + 17, r.Y + 2, 11, 1);
+            screen.Fill(toneTab, d.Digital ? off : on);
+            screen.Text(toneTab.X + 1, toneTab.Y, "Tone (QC II)", d.Digital ? off : on);
+            screen.OnClick(toneTab, () => { pageDialog.Digital = false; pageDialog.Error = null; });
+            screen.Fill(digTab, d.Digital ? on : off);
+            screen.Text(digTab.X + 1, digTab.Y, "Digital", d.Digital ? on : off);
+            screen.OnClick(digTab, () => { pageDialog.Digital = true; pageDialog.Error = null; });
 
-            for (int f = 0; f < 2; f++)
+            Style info = Style.Of(Ansi.White, Ansi.Black);
+            if (d.Digital)
             {
-                int field = f, y = r.Y + 4 + f;
-                bool active = d.Field == f;
-                string value = f == 0 ? d.A : d.B;
-                screen.Text(ix, y, f == 0 ? "Tone A (Hz)" : "Tone B (Hz)", Style.Of(active ? Ansi.BrightWhite : Ansi.White, Ansi.Black, bold: active), 12);
-                Rect box = new Rect(ix + 13, y, 12, 1);
-                Style boxStyle = active ? Style.Of(Ansi.Black, Ansi.BrightWhite, bold: true) : Style.Of(Ansi.White, Ansi.Grey);
-                screen.Fill(box, boxStyle);
-                screen.Text(box.X + 1, y, value + (active ? "▏" : string.Empty), boxStyle, box.W - 1);
-                screen.Text(box.X + box.W + 2, y, f == 0 ? "1 s" : "3 s", Style.Of(Ansi.Grey, Ansi.Black));
-                screen.OnClick(new Rect(ix, y, 30, 1), () => pageDialog.Field = field);
+                screen.Text(ix, r.Y + 4, $"P25 call alert from RID {peer?.ConsoleRid ?? 0} to one radio", info, iw);
+                DrawField(ix, r.Y + 6, "Radio ID", d.Rid, true, null, () => { });
+            }
+            else
+            {
+                List<string> names = TxCapableListening().Select(c => c.Cfg.Name).ToList();
+                screen.Text(ix, r.Y + 4, names.Count > 0 ? $"on: {string.Join(", ", names)}" : "no listening channels: click a card first",
+                            names.Count > 0 ? info : Style.Of(Ansi.Yellow, Ansi.Black), iw);
+                DrawField(ix, r.Y + 5, "Tone A (Hz)", d.A, d.Field == 0, "1 s", () => pageDialog.Field = 0);
+                DrawField(ix, r.Y + 6, "Tone B (Hz)", d.B, d.Field == 1, "3 s", () => pageDialog.Field = 1);
             }
 
             if (d.Error != null)
-                screen.Text(ix, r.Y + 7, d.Error, Style.Of(Ansi.BrightRed, Ansi.Black, bold: true), w - 6);
+                screen.Text(ix, r.Y + 8, d.Error, Style.Of(Ansi.BrightRed, Ansi.Black, bold: true), iw);
             else
-                screen.Text(ix, r.Y + 7, "Tab: switch  Enter: send  Esc: cancel", Style.Of(Ansi.Grey, Ansi.Black), w - 6);
+                screen.Text(ix, r.Y + 8, d.Digital ? "←/→: mode  Enter: send  Esc: cancel" : "←/→: mode  Tab: A/B  Enter: send  Esc: cancel",
+                            Style.Of(Ansi.Grey, Ansi.Black), iw);
 
-            Rect send = new Rect(ix, r.Y + 8, 10, 1), cancel = new Rect(ix + 12, r.Y + 8, 10, 1);
-            Style sendStyle = Style.Of(Ansi.Black, Ansi.BrightYellow, bold: true);
-            screen.Fill(send, sendStyle);
-            screen.Text(send.X + 3, send.Y, "SEND", sendStyle);
+            Rect send = new Rect(ix, r.Y + 9, 10, 1), cancel = new Rect(ix + 12, r.Y + 9, 10, 1);
+            screen.Fill(send, on);
+            screen.Text(send.X + 3, send.Y, "SEND", on);
             screen.OnClick(send, SubmitPage);
             Style cancelStyle = Style.Of(Ansi.Black, Ansi.White, bold: true);
             screen.Fill(cancel, cancelStyle);
             screen.Text(cancel.X + 2, cancel.Y, "CANCEL", cancelStyle);
             screen.OnClick(cancel, () => pageDialog = null);
+        }
+
+        private void DrawField(int x, int y, string label, string value, bool active, string suffix, Action focus)
+        {
+            screen.Text(x, y, label, Style.Of(active ? Ansi.BrightWhite : Ansi.White, Ansi.Black, bold: active), 12);
+            Rect box = new Rect(x + 13, y, 12, 1);
+            Style boxStyle = active ? Style.Of(Ansi.Black, Ansi.BrightWhite, bold: true) : Style.Of(Ansi.White, Ansi.Grey);
+            screen.Fill(box, boxStyle);
+            screen.Text(box.X + 1, y, value + (active ? "▏" : string.Empty), boxStyle, box.W - 1);
+            if (suffix != null)
+                screen.Text(box.X + box.W + 2, y, suffix, Style.Of(Ansi.Grey, Ansi.Black));
+            screen.OnClick(new Rect(x, y, 30, 1), focus);
         }
 
         private void SendTone(TonePlan plan, List<Chan> targets, bool quiet)
@@ -755,6 +821,7 @@ namespace dvmcli
                         case >= '1' and <= '5': SendAlert(e.Char - '0'); break;
                         case 'c': case 'C': ToggleMarker(); break;
                         case 'p': case 'P': OpenPage(); break;
+                        case 'd': case 'D': OpenPage(digital: true); break;
                     }
                     break;
             }
@@ -1129,7 +1196,7 @@ namespace dvmcli
                 screen.Text(1, y, target, Style.Of(Ansi.White), width - 2);
             }
 
-            screen.Text(1, y + 1, "click card: listen  [●]: stop  arrows: move  Space: PTT  1-5: alert  p: page  c: marker  m/M: mute card/all  +/-: vol  k: key  q: quit",
+            screen.Text(1, y + 1, "click card: listen  [●]: stop  arrows: move  Space: PTT  1-5: alert  p/d: tone/digital page  c: marker  m/M: mute card/all  +/-: vol  k: key  q: quit",
                         Style.Of(Ansi.Grey), width - 2);
         }
 

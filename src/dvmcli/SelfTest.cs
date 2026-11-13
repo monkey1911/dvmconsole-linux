@@ -290,13 +290,31 @@ namespace dvmcli
             tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Tab));
             foreach (char ch in "99") tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, ch));
             string dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
-            Check(tui.PageDialogOpen && dialog.Contains("QuickCall II page") && dialog.Contains("1153.4") && dialog.Contains("SEND"),
+            Check(tui.PageDialogOpen && dialog.Contains("Tone (QC II)") && dialog.Contains("1153.4") && dialog.Contains("SEND"),
                   "TUI page dialog opens with p and takes typed tones");
             tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Enter));    // 99 Hz: refused, dialog stays open
             dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
             Check(tui.PageDialogOpen && dialog.Contains("tone B must be"), "TUI page dialog refuses an out-of-range tone");
             tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Escape));
             Check(!tui.PageDialogOpen, "TUI page dialog closes with Esc");
+
+            // digital page (P25 call alert)
+            byte[] alert = CliPeer.BuildCallAlert(1234567, 9511);
+            fnecore.P25.LC.TSBK.IOSP_CALL_ALRT decoded = new fnecore.P25.LC.TSBK.IOSP_CALL_ALRT();
+            Check(alert.Length == P25Defines.P25_TSBK_LENGTH_BYTES && (alert[0] & 0x3F) == P25Defines.TSBK_IOSP_CALL_ALRT &&
+                  decoded.Decode(alert) && decoded.DstId == 1234567 && decoded.SrcId == 9511,
+                  "digital page: call alert TSBK encodes target and source RIDs (CRC checks on decode)");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, 'd'));
+            foreach (char ch in "1234567") tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, ch));
+            dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
+            Check(tui.PageDialogOpen && tui.PageDialogDigital && dialog.Contains("Radio ID") && dialog.Contains("1234567"),
+                  "TUI d opens the page dialog in digital mode and takes a radio ID");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Enter));    // offline: refused with a message
+            dialog = string.Join("\n", Enumerable.Range(0, 40).Select(y => tui.Render(120, 40).RowText(y)));
+            Check(tui.PageDialogOpen && dialog.Contains("not connected"), "TUI digital page refused while offline, dialog stays open");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Left));
+            Check(!tui.PageDialogDigital, "TUI arrows switch the page dialog between tone and digital");
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Escape));
         }
 
         /// <summary>
