@@ -190,6 +190,9 @@ namespace dvmcli
                 // 10. audio device lookup (pw-dump parsing, --output / --input matching, startup report)
                 AudioDeviceTests();
 
+                // 11. microphone level meter
+                MeterTests(cp, sys);
+
                 // 8. WAV writer
                 string wavPath = Path.Combine(tmp, "test.wav");
                 using (WavSink wav = new WavSink(wavPath))
@@ -241,6 +244,62 @@ namespace dvmcli
         "value": "{\"name\":\"alsa_input.usb-Plantronics_Savi_8200-01.mono-fallback\"}" } ] }
 ]
 """;
+
+        private static short[] Sine(double amplitude, int n = 160, double hz = 1000)
+        {
+            short[] b = new short[n];
+            for (int i = 0; i < n; i++)
+                b[i] = (short)Math.Round(amplitude * Math.Sin(2 * Math.PI * hz * i / 8000.0));
+            return b;
+        }
+
+        private static void MeterTests(Codeplug cp, Codeplug.System sys)
+        {
+            DateTime t0 = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            LevelMeter m = new LevelMeter();
+            Check(!m.Read(t0).Active, "mic meter: idle before any audio");
+
+            m.Push(Sine(16384), t0);                         // -6 dBFS peak, about -9 dBFS RMS
+            LevelMeter.Reading r = m.Read(t0);
+            Check(r.Active && Math.Abs(r.LevelDb - -9.03) < 0.3 && Math.Abs(r.PeakDb - -6.02) < 0.3 && !r.Clipping,
+                  $"mic meter: a -6 dBFS sine reads about -9 dB RMS with a -6 dB peak ({r.LevelDb:F1} / {r.PeakDb:F1})");
+
+            m.Push(new short[160], t0.AddSeconds(0.5));       // silence: the level falls at 20 dB/s, the peak holds
+            r = m.Read(t0.AddSeconds(0.5));
+            Check(Math.Abs(r.LevelDb - -19.03) < 0.3 && Math.Abs(r.PeakDb - -6.02) < 0.3,
+                  $"mic meter: level falls 10 dB in 0.5 s and the peak is held ({r.LevelDb:F1} / {r.PeakDb:F1})");
+
+            m.Push(new short[160], t0.AddSeconds(2.2));
+            r = m.Read(t0.AddSeconds(2.2));
+            Check(r.LevelDb <= LevelMeter.FloorDb + 0.01 && r.PeakDb <= LevelMeter.FloorDb + 0.01, "mic meter: the peak hold expires and silence reads as the floor");
+            Check(!m.Read(t0.AddSeconds(3)).Active, "mic meter: goes idle when audio stops");
+
+            short[] loud = Sine(32767);
+            m.Push(loud, t0.AddSeconds(4));
+            Check(m.Read(t0.AddSeconds(4)).Clipping, "mic meter: a full-scale block shows CLIP");
+            m.Push(Sine(1000), t0.AddSeconds(6));
+            Check(!m.Read(t0.AddSeconds(6)).Clipping, "mic meter: CLIP clears after the hold time");
+
+            // in the TUI: the bottom edge of the title box
+            Tui tui = new Tui(cp, sys, TimeSpan.FromSeconds(120), null) { NoAudio = true };
+            Check(Tui.MeterCells(31) == 13 && Tui.MeterCells(20) == 0, "mic meter: bar width fits the title box, hidden when there's no room");
+            string edge = tui.Render(120, 40).RowText(Tui.TitleHeight - 1);
+            Check(edge.Contains("MIC off"), "TUI shows 'MIC off' while the microphone is closed");
+
+            tui.HandleInput(new InputEvent(InputKind.Key, InputKey.Char, 'v'));
+            Check(tui.MicMonitor, "TUI v opens the mic for the meter");
+            tui.MicLevel.Push(Sine(8192));                    // about -15 dB RMS
+            edge = tui.Render(120, 40).RowText(Tui.TitleHeight - 1);
+            Check(edge.Contains(" MIC ") && edge.Contains("█") && edge.Contains("dB") && !edge.Contains("MIC off"),
+                  $"TUI meter shows the level ({edge.Trim()})");
+            tui.MicLevel.Push(loud);
+            edge = tui.Render(120, 40).RowText(Tui.TitleHeight - 1);
+            Check(edge.Contains("CLIP"), "TUI meter shows CLIP on a full-scale input");
+
+            int at = edge.IndexOf("MIC", StringComparison.Ordinal);
+            tui.HandleInput(new InputEvent(InputKind.Click, X: at, Y: Tui.TitleHeight - 1));
+            Check(!tui.MicMonitor && tui.Render(120, 40).RowText(Tui.TitleHeight - 1).Contains("MIC off"), "TUI click on the meter closes the mic");
+        }
 
         private static void AudioDeviceTests()
         {

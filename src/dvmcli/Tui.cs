@@ -80,6 +80,12 @@ namespace dvmcli
         private PipeWireCapture capture;
         private volatile string pendingTxStop;
 
+        // microphone: one capture shared by transmit and the level meter
+        private readonly LevelMeter micLevel = new LevelMeter();
+        private volatile P25Transmitter txFeed;     // gets mic audio while transmitting
+        private bool micMonitor;                    // mic open just for the meter (v)
+        private volatile string pendingMicFail;
+
         // remembered settings
         private readonly string settingsPath;
         private readonly AppSettings settings;
@@ -112,6 +118,8 @@ namespace dvmcli
 
         /// <summary>Set when the user asks to quit (self-test hook).</summary>
         internal bool QuitRequested => quit;
+        internal bool MicMonitor => micMonitor;
+        internal LevelMeter MicLevel => micLevel;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="Tui"/> class.
@@ -198,6 +206,8 @@ namespace dvmcli
                 CancelTones(wait: true);
                 SaveSettings();     // before the channels are closed below
                 StopTx("console closed");
+                micMonitor = false;
+                CloseMicIfUnused();
                 foreach (Chan c in chans)
                     Deselect(c, quiet: true);
                 peer.Stop();
@@ -436,22 +446,16 @@ namespace dvmcli
                 return;
             }
 
-            try
-            {
-                PipeWireCapture cap = new PipeWireCapture(target: Audio?.InputTarget);
-                cap.Block += t.PushAudio;
-                cap.Failed += msg => pendingTxStop = $"microphone: {msg}";
-                capture = cap;
-            }
-            catch (Exception ex)
+            if (!OpenMic(out string micError))
             {
                 t.Stop();
-                AddLog($"{c.Cfg.Name}: no microphone ({ex.Message})");
+                AddLog($"{c.Cfg.Name}: no microphone ({micError})");
                 return;
             }
 
             tx = t;
             txChan = c;
+            txFeed = t;
             if (talkPermit)
                 c.Sink?.Write(TalkPermitPcm());     // played locally once the call has started, as the Windows console does
             AddLog($"{c.Cfg.Name}: TX start as {peer.ConsoleRid}{(t.Encrypted ? $" ({KeyStore.AlgorithmName(t.AlgorithmId)} key 0x{t.KeyId:X4})" : " (clear)")}");
@@ -463,9 +467,7 @@ namespace dvmcli
             if (t == null)
                 return;
 
-            PipeWireCapture cap = capture;
-            capture = null;
-            cap?.Dispose();
+            txFeed = null;      // stop feeding mic audio before the call ends
 
             double secs = (DateTime.Now - t.StartedAt).TotalSeconds;
             bool was = t.IsTransmitting;
@@ -478,12 +480,93 @@ namespace dvmcli
 
             tx = null;
             txChan = null;
+            CloseMicIfUnused();
         }
 
         private bool Transmitting => tx != null && tx.IsTransmitting;
 
+        /*
+        ** Microphone and level meter
+        */
+
+        /// <summary>Opens the microphone if it isn't open yet.</summary>
+        private bool OpenMic(out string error)
+        {
+            error = null;
+            if (capture != null)
+                return true;
+            try
+            {
+                PipeWireCapture cap = new PipeWireCapture(target: Audio?.InputTarget);
+                cap.Block += OnMicBlock;
+                cap.Failed += msg => pendingMicFail = msg;
+                capture = cap;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        // capture thread
+        private void OnMicBlock(short[] samples)
+        {
+            micLevel.Push(samples);
+            txFeed?.PushAudio(samples);
+        }
+
+        /// <summary>Closes the microphone once neither transmit nor the meter needs it.</summary>
+        private void CloseMicIfUnused()
+        {
+            if (micMonitor || txFeed != null)
+                return;
+            PipeWireCapture cap = capture;
+            capture = null;
+            cap?.Dispose();
+            micLevel.Reset();
+        }
+
+        private void ToggleMicMonitor()
+        {
+            if (micMonitor)
+            {
+                micMonitor = false;
+                CloseMicIfUnused();
+                AddLog("mic meter off");
+                return;
+            }
+
+            micMonitor = true;
+            if (!NoAudio && !OpenMic(out string error))
+            {
+                micMonitor = false;
+                AddLog($"mic meter: no microphone ({error})");
+                return;
+            }
+            AddLog("mic meter on: the microphone stays open (nothing is transmitted); v turns it off");
+        }
+
         private void Housekeeping()
         {
+            string micFail = pendingMicFail;
+            if (micFail != null)
+            {
+                pendingMicFail = null;
+                PipeWireCapture cap = capture;
+                capture = null;
+                cap?.Dispose();
+                micLevel.Reset();
+                if (micMonitor)
+                {
+                    micMonitor = false;
+                    AddLog($"mic meter off: microphone stopped ({micFail})");
+                }
+                if (tx != null)
+                    pendingTxStop = $"microphone: {micFail}";
+            }
+
             string stop = pendingTxStop;
             if (stop != null)
             {
@@ -1177,6 +1260,7 @@ namespace dvmcli
                         case 'c': case 'C': ToggleMarker(); break;
                         case 'p': case 'P': OpenPage(); break;
                         case 'd': case 'D': OpenPage(digital: true); break;
+                        case 'v': case 'V': ToggleMicMonitor(); break;
                     }
                     break;
             }
@@ -1335,6 +1419,72 @@ namespace dvmcli
             used += screen.Text(tx0 + used, 1, connected ? "  ● connected" : "  ○ connecting…",
                                 connected ? Style.Of(Ansi.BrightGreen) : Style.Of(Ansi.Yellow), inner - used);
             screen.Text(tx0 + used, 1, $"  peer {system.PeerId}  RID {peer?.ConsoleRid ?? 0}  keys {keys.Count}", Style.Of(Ansi.White), inner - used);
+
+            DrawMicMeter(boxW);
+        }
+
+        /// <summary>Width of the meter's bar for a title box this wide (0 = no room).</summary>
+        internal static int MeterCells(int boxW)
+        {
+            int cells = Math.Min(boxW - 18, 24);
+            return cells < 6 ? 0 : cells;
+        }
+
+        /// <summary>
+        /// Draws the microphone level meter in the bottom edge of the title box:
+        /// " MIC ▕██████▌·····▏ -14 dB ". Green up to -18 dBFS, yellow to -6, red above;
+        /// ▌ marks the recent peak. Click it (or press v) to open or close the mic for the meter.
+        /// </summary>
+        private void DrawMicMeter(int boxW)
+        {
+            int cells = MeterCells(boxW);
+            if (cells == 0)
+                return;
+
+            int y = TitleHeight - 1;
+            bool txOn = Transmitting;
+            bool open = txOn || micMonitor;
+
+            if (!open)
+            {
+                string off = " MIC off · v to check level ";
+                int ox = Math.Max(1, boxW - 1 - ScreenBuffer.TextWidth(off));
+                int w = screen.Text(ox, y, off, Style.Of(Ansi.Grey), boxW - 1 - ox);
+                screen.OnClick(new Rect(ox, y, w, 1), ToggleMicMonitor);
+                return;
+            }
+
+            LevelMeter.Reading m = micLevel.Read();
+            const double span = -LevelMeter.FloorDb;
+            int filled = m.Active ? (int)Math.Round((m.LevelDb - LevelMeter.FloorDb) / span * cells) : 0;
+            int peakCell = m.Active ? (int)Math.Round((m.PeakDb - LevelMeter.FloorDb) / span * cells) - 1 : -1;
+
+            string label = txOn ? " TX MIC " : " MIC ";
+            string value = !m.Active ? "  --   " : m.Clipping ? " CLIP! " : $" {Math.Round(m.LevelDb),3:F0} dB";
+            int total = ScreenBuffer.TextWidth(label) + cells + 2 + 8;
+            int x = Math.Max(1, boxW - 1 - total);
+            int start = x;
+
+            x += screen.Text(x, y, label, txOn ? Style.Of(Ansi.BrightRed, bold: true) : Style.Of(Ansi.BrightWhite, bold: true));
+            x += screen.Text(x, y, "▕", Style.Of(Ansi.Grey));
+            for (int i = 0; i < cells; i++)
+            {
+                double cellDb = LevelMeter.FloorDb + span * (i + 1) / cells;
+                Ansi colour = cellDb <= -18 ? Ansi.BrightGreen : cellDb <= -6 ? Ansi.BrightYellow : Ansi.BrightRed;
+                if (i < filled)
+                    screen.Text(x + i, y, "█", Style.Of(colour));
+                else if (i == peakCell)
+                    screen.Text(x + i, y, "▌", Style.Of(colour));
+                else
+                    screen.Text(x + i, y, "·", Style.Of(Ansi.Grey));
+            }
+            x += cells;
+            x += screen.Text(x, y, "▏", Style.Of(Ansi.Grey));
+            x += screen.Text(x, y, value + " ", m.Clipping ? Style.Of(Ansi.BrightWhite, Ansi.Red, bold: true) : Style.Of(Ansi.White));
+
+            // clicking closes the meter's mic (never ends a transmission)
+            if (!txOn)
+                screen.OnClick(new Rect(start, y, x - start, 1), ToggleMicMonitor);
         }
 
         private void Button(Rect r, string label, Style style, Action action)
@@ -1557,7 +1707,7 @@ namespace dvmcli
                 screen.Text(1, y, target, Style.Of(Ansi.White), width - 2);
             }
 
-            screen.Text(1, y + 1, "click card: listen  [●]: stop  Space: PTT  1-6: alert  p/d: page  r: radio cmd  c: marker  t: talk permit  m/M: mute card/all  +/-: vol  k: key  q: quit",
+            screen.Text(1, y + 1, "click card: listen  [●]: stop  Space: PTT  1-6: alert  p/d: page  r: radio cmd  c: marker  t: talk permit  v: mic meter  m/M: mute card/all  +/-: vol  k: key  q: quit",
                         Style.Of(Ansi.Grey), width - 2);
         }
 

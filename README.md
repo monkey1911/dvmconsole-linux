@@ -103,6 +103,7 @@ Channels are shown as cards, up to four across. The mouse works in any terminal 
 | **RADIO** (title bar) | Radio command: enter a radio ID, pick Check, Inhibit or Uninhibit, then SEND |
 | **MARK** (title bar) | Turn the channel marker on or off |
 | **EXIT** (title bar) | Quit |
+| **MIC** meter (bottom edge of the title box) | Open or close the microphone for the level meter |
 | A card | Focus it and start listening |
 | `[●]` on a card | Stop listening |
 | `[-]` `[+]` `[mute]` on a card | That card's volume and mute |
@@ -119,6 +120,7 @@ Channels are shown as cards, up to four across. The mouse works in any terminal 
 | t | Talk permit tone on or off |
 | p / d | Open the page box in tone or digital mode (←/→ switch modes, Tab switches tone A / B, Enter sends, Esc cancels) |
 | c | Turn the channel marker on or off |
+| v | Microphone level meter on or off (without transmitting) |
 | m / M | Mute the focused card / mute everything |
 | + / - | Volume of the focused card |
 | k | Request the focused card's key from the FNE again |
@@ -129,6 +131,8 @@ Alert tones match the Windows console's built-in tones 1–6 (5 seconds each). A
 Radio check, inhibit and uninhibit are sent as in the Windows console. Inhibit disables the radio, so it asks you to press SEND a second time. Replies ("radio 1234 answered the radio check", inhibit / uninhibit confirmations) are logged when the FNE passes them on.
 
 The talk permit tone (a short 1200 Hz beep when transmit starts) is on by default; `t` turns it off.
+
+The microphone level meter sits in the bottom edge of the title box. It shows whenever the microphone is open: always while you transmit (labelled `TX MIC`), and when you press `v` or click it to check your level without transmitting. `v` leaves the microphone open until you press it again, but nothing is sent. The bar is green up to -18 dB, yellow to -6 dB and red above, `▌` marks the recent peak, and `CLIP!` means the input hit full scale. For clean audio, keep speech mostly in the green to yellow and never clipping. Adjust the level with your system's input volume, for example `wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 0.8`.
 
 Settings are remembered per system in `~/.config/dvmcli/settings.json`: which channels you're listening to, the focused card, volumes, mutes, global mute, the talk permit tone and the last page / radio values. Use `--settings FILE` for a different file or `--no-settings` to start fresh without saving. The channel marker always starts off. The file holds no passwords or keys.
 
