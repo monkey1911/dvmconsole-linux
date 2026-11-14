@@ -3,7 +3,7 @@
 * dvmcli - headless Linux proof of concept for the DVM Desktop Dispatch Console.
 *
 * Audio outputs for decoded 8 kHz mono 16-bit PCM:
-*  - PipeWireSink streams to the default PipeWire output through pw-play (or pw-cat).
+*  - PipeWireSink streams to a PipeWire output (the default, or --output) through pw-play (or pw-cat).
 *  - WavSink records to a .wav file.
 */
 
@@ -21,7 +21,7 @@ namespace dvmcli
     }
 
     /// <summary>
-    /// Plays PCM on the default PipeWire output by piping it into pw-play.
+    /// Plays PCM on a PipeWire output by piping it into pw-play.
     /// </summary>
     public sealed class PipeWireSink : IAudioSink
     {
@@ -38,7 +38,8 @@ namespace dvmcli
         /// Starts the player process.
         /// </summary>
         /// <param name="command">Explicit player command, or null to find pw-play / pw-cat on PATH.</param>
-        public PipeWireSink(string command = null)
+        /// <param name="target">PipeWire node name to play to, or null for the default output.</param>
+        public PipeWireSink(string command = null, string target = null)
         {
             Command = command ?? FindPlayer() ??
                 throw new InvalidOperationException("neither pw-play nor pw-cat was found; install pipewire (pacman -S pipewire) or use --no-play");
@@ -57,8 +58,14 @@ namespace dvmcli
                 psi.ArgumentList.Add("--playback");
             // --raw: stdin carries bare PCM samples (without it pw-cat tries to open "-" as a sound file)
             foreach (string arg in new[] { "--raw", "--rate", SampleRate.ToString(), "--channels", "1", "--format", "s16",
-                                           "--media-role", "Communication", "-" })
+                                           "--media-role", "Communication" })
                 psi.ArgumentList.Add(arg);
+            if (!string.IsNullOrEmpty(target))
+            {
+                psi.ArgumentList.Add("--target");
+                psi.ArgumentList.Add(target);
+            }
+            psi.ArgumentList.Add("-");
 
             player = Process.Start(psi) ?? throw new InvalidOperationException($"failed to start {Command}");
             stdin = player.StandardInput.BaseStream;

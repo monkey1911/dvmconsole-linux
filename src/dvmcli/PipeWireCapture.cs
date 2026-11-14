@@ -2,7 +2,7 @@
 /**
 * dvmcli - headless Linux proof of concept for the DVM Desktop Dispatch Console.
 *
-* Microphone capture from the default PipeWire source via pw-record, delivered as
+* Microphone capture from a PipeWire source (the default, or --input) via pw-record, delivered as
 * 20 ms blocks of 8 kHz mono 16-bit PCM.
 */
 
@@ -31,7 +31,9 @@ namespace dvmcli
         /// <summary>
         /// Starts pw-record (or pw-cat --record).
         /// </summary>
-        public PipeWireCapture(string command = null)
+        /// <param name="command">Explicit recorder command, or null to find pw-record / pw-cat on PATH.</param>
+        /// <param name="target">PipeWire node name to record from, or null for the default input.</param>
+        public PipeWireCapture(string command = null, string target = null)
         {
             Command = command ?? FindRecorder() ??
                 throw new InvalidOperationException("neither pw-record nor pw-cat was found; install pipewire");
@@ -46,8 +48,14 @@ namespace dvmcli
             if (Path.GetFileName(Command) == "pw-cat")
                 psi.ArgumentList.Add("--record");
             foreach (string arg in new[] { "--raw", "--rate", PipeWireSink.SampleRate.ToString(), "--channels", "1", "--format", "s16",
-                                           "--media-role", "Communication", "-" })
+                                           "--media-role", "Communication" })
                 psi.ArgumentList.Add(arg);
+            if (!string.IsNullOrEmpty(target))
+            {
+                psi.ArgumentList.Add("--target");
+                psi.ArgumentList.Add(target);
+            }
+            psi.ArgumentList.Add("-");
 
             recorder = Process.Start(psi) ?? throw new InvalidOperationException($"failed to start {Command}");
             recorder.ErrorDataReceived += (_, _) => { };   // drain stderr so it can't block

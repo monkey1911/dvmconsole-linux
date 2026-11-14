@@ -98,6 +98,9 @@ namespace dvmcli
         /// <summary>Self-test hook: don't start audio players when selecting channels.</summary>
         internal bool NoAudio { get; set; }
 
+        /// <summary>Output and input to use (from --output / --input or the defaults); null means PipeWire's defaults, unreported.</summary>
+        internal AudioSelection Audio { get; set; }
+
         /// <summary>Index of the focused card (self-test hook).</summary>
         internal int Cursor => cursor;
 
@@ -163,6 +166,11 @@ namespace dvmcli
             peer.P25Frame += OnFrame;
             peer.P25Control += OnP25Control;
 
+            if (Audio != null)
+            {
+                AddLog(Audio.OutputReport);
+                AddLog(Audio.InputReport);
+            }
             AddLog($"connecting to {system.Name} ({system.Address}:{system.Port}) as peer {system.PeerId}");
             if (settingsError != null)
                 AddLog(settingsError);
@@ -278,7 +286,7 @@ namespace dvmcli
             {
                 try
                 {
-                    PipeWireSink sink = new PipeWireSink();
+                    PipeWireSink sink = new PipeWireSink(target: Audio?.OutputTarget);
                     sink.Failed += msg => AddLog($"{c.Cfg.Name}: {msg}");
                     c.Sink = sink;
                 }
@@ -430,7 +438,7 @@ namespace dvmcli
 
             try
             {
-                PipeWireCapture cap = new PipeWireCapture();
+                PipeWireCapture cap = new PipeWireCapture(target: Audio?.InputTarget);
                 cap.Block += t.PushAudio;
                 cap.Failed += msg => pendingTxStop = $"microphone: {msg}";
                 capture = cap;

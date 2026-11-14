@@ -187,6 +187,9 @@ namespace dvmcli
                 // 9. TUI: card grid, buttons and clicks (no terminal or network needed)
                 TuiTests(cp, sys);
 
+                // 10. audio device lookup (pw-dump parsing, --output / --input matching, startup report)
+                AudioDeviceTests();
+
                 // 8. WAV writer
                 string wavPath = Path.Combine(tmp, "test.wav");
                 using (WavSink wav = new WavSink(wavPath))
@@ -204,6 +207,81 @@ namespace dvmcli
 
             Console.WriteLine(failures == 0 ? "ALL TESTS PASSED" : $"{failures} TEST(S) FAILED");
             return failures == 0 ? 0 : 1;
+        }
+
+        // trimmed pw-dump output: two sinks, three sources, a playback stream and the "default" metadata
+        private const string PwDumpFixture = """
+[
+  { "id": 34, "type": "PipeWire:Interface:Node", "info": { "props": {
+      "media.class": "Audio/Sink", "object.serial": 34,
+      "node.name": "alsa_output.pci-0000_0a_00.3.iec958-stereo",
+      "node.description": "Family 17h (Models 00h-0fh) HD Audio Controller Digital Stereo (IEC958)" } } },
+  { "id": 77, "type": "PipeWire:Interface:Node", "info": { "props": {
+      "media.class": "Audio/Sink", "object.serial": 2077,
+      "node.name": "alsa_output.usb-Plantronics_Savi_8200-00.analog-stereo",
+      "node.description": "Plantronics Savi 8200 Office Series Analog Stereo" } } },
+  { "id": 46, "type": "PipeWire:Interface:Node", "info": { "props": {
+      "media.class": "Audio/Source", "object.serial": 46,
+      "node.name": "alsa_input.pci-0000_0a_00.3.analog-stereo",
+      "node.description": "Family 17h (Models 00h-0fh) HD Audio Controller Analog Stereo" } } },
+  { "id": 73, "type": "PipeWire:Interface:Node", "info": { "props": {
+      "media.class": "Audio/Source", "object.serial": 73,
+      "node.name": "alsa_input.usb-Plantronics_Savi_8200-01.mono-fallback",
+      "node.description": "Plantronics Savi 8200 Office Series Mono" } } },
+  { "id": 75, "type": "PipeWire:Interface:Node", "info": { "props": {
+      "media.class": "Audio/Source", "object.serial": 75,
+      "node.name": "alsa_input.usb-USB_2.0_Camera-02.mono-fallback",
+      "node.description": "USB 2.0 Camera Mono" } } },
+  { "id": 102, "type": "PipeWire:Interface:Node", "info": { "props": {
+      "media.class": "Stream/Output/Audio", "node.name": "Brave", "node.description": "Brave" } } },
+  { "id": 31, "type": "PipeWire:Interface:Metadata", "props": { "metadata.name": "default" }, "metadata": [
+      { "subject": 0, "key": "default.audio.sink", "type": "Spa:String:JSON",
+        "value": { "name": "alsa_output.usb-Plantronics_Savi_8200-00.analog-stereo" } },
+      { "subject": 0, "key": "default.audio.source", "type": "Spa:String:JSON",
+        "value": "{\"name\":\"alsa_input.usb-Plantronics_Savi_8200-01.mono-fallback\"}" } ] }
+]
+""";
+
+        private static void AudioDeviceTests()
+        {
+            AudioDeviceList list = AudioDeviceList.Parse(PwDumpFixture);
+            Check(list.Outputs.Count == 2 && list.Inputs.Count == 3, "pw-dump: outputs and inputs found, streams left out");
+            Check(list.DefaultOutput?.Id == 77 && list.DefaultInput?.Id == 73, "pw-dump: default output and input read from metadata (object and string forms)");
+
+            AudioDevice savi = AudioDeviceList.Resolve(list.Outputs, "savi", "--output");
+            Check(savi.Id == 77, "--output matches a unique part of the name, case ignored");
+            Check(AudioDeviceList.Resolve(list.Outputs, "34", "--output").Id == 34 &&
+                  AudioDeviceList.Resolve(list.Outputs, "2077", "--output").Id == 77, "--output matches an ID or a serial");
+            Check(AudioDeviceList.Resolve(list.Inputs, "alsa_input.usb-USB_2.0_Camera-02.mono-fallback", "--input").Id == 75,
+                  "--input matches an exact node name");
+
+            string Error(Action a)
+            {
+                try { a(); return null; }
+                catch (ArgumentException ex) { return ex.Message; }
+            }
+            string ambiguous = Error(() => AudioDeviceList.Resolve(list.Inputs, "mono", "--input"));
+            Check(ambiguous != null && ambiguous.Contains("more than one") && ambiguous.Contains("USB 2.0 Camera Mono"),
+                  "an ambiguous name is refused and the matches are listed");
+            string missing = Error(() => AudioDeviceList.Resolve(list.Outputs, "HDMI", "--output"));
+            Check(missing != null && missing.Contains("Plantronics Savi 8200 Office Series Analog Stereo"),
+                  "an unknown name is refused and the outputs are listed");
+
+            AudioSelection defaults = AudioSelection.Choose(null, null, () => list);
+            Check(defaults.OutputTarget == null && defaults.InputTarget == null &&
+                  defaults.OutputReport == "audio output: Plantronics Savi 8200 Office Series Analog Stereo (system default)" &&
+                  defaults.InputReport == "audio input: Plantronics Savi 8200 Office Series Mono (system default)",
+                  "no options: the system defaults are used and named in the log");
+
+            AudioSelection chosen = AudioSelection.Choose("IEC958", "camera", () => list);
+            Check(chosen.OutputTarget == "alsa_output.pci-0000_0a_00.3.iec958-stereo" &&
+                  chosen.InputTarget == "alsa_input.usb-USB_2.0_Camera-02.mono-fallback" &&
+                  chosen.OutputReport.EndsWith("(--output)") && chosen.InputReport.EndsWith("(--input)"),
+                  "--output / --input: the chosen devices are targeted by node name and named in the log");
+
+            AudioSelection noPw = AudioSelection.Choose(null, null, () => throw new InvalidOperationException("pw-dump not found"));
+            Check(noPw.OutputTarget == null && noPw.OutputReport.Contains("PipeWire default") && noPw.OutputReport.Contains("pw-dump not found"),
+                  "without pw-dump the defaults are still used and the log says why they can't be named");
         }
 
         private static void TuiTests(Codeplug cp, Codeplug.System sys)

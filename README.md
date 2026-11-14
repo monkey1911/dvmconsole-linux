@@ -78,6 +78,7 @@ Other `listen` options:
 | `--wav FILE` | Also record decoded audio to a WAV file |
 | `--no-play` | Don't play audio (useful with `--wav`, or to just watch activity) |
 | `--gain N` | Multiply output volume, for example `2` |
+| `--output DEVICE` | Play to this audio output instead of the system default (see [Audio devices](#audio-devices)) |
 | `--player CMD` | Use a different player command than `pw-play` |
 | `--verbose` | Log every network frame and fnecore debug messages |
 
@@ -131,7 +132,30 @@ The talk permit tone (a short 1200 Hz beep when transmit starts) is on by defaul
 
 Settings are remembered per system in `~/.config/dvmcli/settings.json`: which channels you're listening to, the focused card, volumes, mutes, global mute, the talk permit tone and the last page / radio values. Use `--settings FILE` for a different file or `--no-settings` to start fresh without saving. The channel marker always starts off. The file holds no passwords or keys.
 
-Transmit uses the default PipeWire microphone and the system's `rid` as the source ID. A secure channel never transmits in the clear: without its key, transmit is refused. Transmissions stop automatically after 120 seconds; change that with `--tx-limit SECONDS`. Add `--log FILE` to keep a copy of the log.
+Transmit uses the system's `rid` as the source ID, and the default microphone unless you start the TUI with `--input` (see [Audio devices](#audio-devices)). A secure channel never transmits in the clear: without its key, transmit is refused. Transmissions stop automatically after 120 seconds; change that with `--tx-limit SECONDS`. Add `--log FILE` to keep a copy of the log.
+
+## Audio devices
+
+Without options, dvmcli plays to the system's default output and transmits from the default input, the ones marked `*` in `wpctl status`. Both `listen` and `tui` log which devices they're using at startup, for example:
+
+```
+audio output: Plantronics Savi 8200 Office Series Analog Stereo (system default)
+audio input: Plantronics Savi 8200 Office Series Mono (system default)
+```
+
+List the outputs and inputs PipeWire knows about:
+
+```bash
+./dvmcli devices
+```
+
+To use a different device, give `--output` (playback) or `--input` (microphone, `tui` only) any part of its name that matches only that device. Case doesn't matter:
+
+```bash
+./dvmcli tui --codeplug ~/dvm/codeplug-linux.yml --output "Savi" --input "Savi"
+```
+
+The ID from `dvmcli devices` or `wpctl status` works too, but IDs can change after a reboot or replug, so names are more reliable. If a name matches nothing or more than one device, dvmcli stops and lists the choices. If the chosen device disappears while dvmcli is running, PipeWire moves the audio to the default device.
 
 ## Building from source
 

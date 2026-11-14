@@ -4,7 +4,9 @@
 *
 *   dvmcli list     --codeplug FILE
 *   dvmcli listen   --codeplug FILE (--channel NAME | --tg TGID) [--system NAME]
-*                   [--wav FILE] [--no-play] [--player CMD] [--verbose]
+*                   [--wav FILE] [--no-play] [--player CMD] [--output DEVICE] [--verbose]
+*   dvmcli tui      --codeplug FILE [--output DEVICE] [--input DEVICE] ...
+*   dvmcli devices
 *   dvmcli selftest
 */
 
@@ -39,6 +41,7 @@ namespace dvmcli
                     "list" => List(opt),
                     "listen" => Listen(opt),
                     "tui" => RunTui(opt),
+                    "devices" => Devices(),
                     "selftest" => SelfTest.Run(),
                     _ => Usage($"unknown command '{args[0]}'")
                 };
@@ -66,12 +69,16 @@ namespace dvmcli
             Console.WriteLine("usage:");
             Console.WriteLine("  dvmcli list     --codeplug FILE");
             Console.WriteLine("  dvmcli listen   --codeplug FILE (--channel NAME | --tg TGID) [--system NAME]");
-            Console.WriteLine("                  [--wav FILE] [--no-play] [--player CMD] [--verbose]");
+            Console.WriteLine("                  [--wav FILE] [--no-play] [--player CMD] [--output DEVICE] [--verbose]");
             Console.WriteLine("  dvmcli tui      --codeplug FILE [--system NAME] [--tx-limit SECONDS] [--log FILE]");
             Console.WriteLine("                  [--marker-interval SECONDS] [--settings FILE | --no-settings]");
+            Console.WriteLine("                  [--output DEVICE] [--input DEVICE]");
+            Console.WriteLine("  dvmcli devices");
             Console.WriteLine("  dvmcli selftest");
             Console.WriteLine();
             Console.WriteLine("listen follows one P25 talkgroup and plays clear calls through PipeWire (pw-play).");
+            Console.WriteLine("devices lists the audio outputs and inputs. --output / --input pick one by any unique");
+            Console.WriteLine("part of its name (or its ID); without them the system default is used.");
             Console.WriteLine("Press Ctrl+C to stop.");
         }
 
@@ -176,12 +183,17 @@ namespace dvmcli
             List<IAudioSink> sinks = new List<IAudioSink>();
             try
             {
+                if (!string.IsNullOrWhiteSpace(opt.Input))
+                    Say("note: --input is only used by 'tui' (listen doesn't transmit)");
                 if (!opt.NoPlay)
                 {
-                    PipeWireSink pw = new PipeWireSink(opt.Player);
+                    AudioSelection audio = AudioSelection.Choose(opt.Output, null);
+                    PipeWireSink pw = new PipeWireSink(opt.Player, audio.OutputTarget);
                     sinks.Add(pw);
-                    Say($"audio: playing through {pw.Command}");
+                    Say($"{audio.OutputReport}, through {Path.GetFileName(pw.Command)}");
                 }
+                else if (!string.IsNullOrWhiteSpace(opt.Output))
+                    Say("note: --output is ignored with --no-play");
                 if (!string.IsNullOrWhiteSpace(opt.Wav))
                 {
                     sinks.Add(new WavSink(opt.Wav));
@@ -251,9 +263,42 @@ namespace dvmcli
             if (PipeWireCapture.FindRecorder() == null)
                 Console.Error.WriteLine("warning: pw-record not found; transmit won't work");
 
+            // resolved before the TUI takes over the terminal, so a bad --output / --input is a plain error
+            AudioSelection audio = AudioSelection.Choose(opt.Output, opt.Input);
+
             string logFile = string.IsNullOrWhiteSpace(opt.LogFile) ? null : Path.GetFullPath(opt.LogFile);
             return new Tui(cp, system, TimeSpan.FromSeconds(opt.TxLimitSeconds), logFile, TimeSpan.FromSeconds(opt.MarkerSeconds),
-                           opt.NoSettings ? null : opt.SettingsFile ?? AppSettings.DefaultPath).Run();
+                           opt.NoSettings ? null : opt.SettingsFile ?? AppSettings.DefaultPath) { Audio = audio }.Run();
+        }
+
+        private static int Devices()
+        {
+            AudioDeviceList list;
+            try { list = AudioDeviceList.Query(); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is System.Text.Json.JsonException)
+            {
+                Console.Error.WriteLine($"error: can't list audio devices: {ex.Message}");
+                return 1;
+            }
+
+            void Print(string title, List<AudioDevice> devs, string defName)
+            {
+                Console.WriteLine($"{title} (* = system default):");
+                if (devs.Count == 0)
+                    Console.WriteLine("  (none)");
+                foreach (AudioDevice d in devs)
+                {
+                    Console.WriteLine($"  {(d.Name == defName ? "*" : " ")} {d.Id,4}  {d.Label}");
+                    Console.WriteLine($"          {d.Name}");
+                }
+                Console.WriteLine();
+            }
+
+            Print("Outputs", list.Outputs, list.DefaultOutputName);
+            Print("Inputs", list.Inputs, list.DefaultInputName);
+            Console.WriteLine("Pick one with --output or --input and any part of its name that matches only that device,");
+            Console.WriteLine("for example --output \"Savi\". IDs work too, but they can change after a reboot or replug.");
+            return 0;
         }
 
         /// <summary>
@@ -280,7 +325,7 @@ namespace dvmcli
         /// </summary>
         private sealed class Options
         {
-            public string Codeplug, Channel, Tg, SystemName, Wav, Player, LogFile;
+            public string Codeplug, Channel, Tg, SystemName, Wav, Player, LogFile, Output, Input;
             public bool NoPlay, Verbose;
             public double Gain = 1.0;
             public int TxLimitSeconds = 120;
@@ -302,6 +347,8 @@ namespace dvmcli
                         case "--system": o.SystemName = Next(); break;
                         case "--wav": o.Wav = Next(); break;
                         case "--player": o.Player = Next(); break;
+                        case "--output": o.Output = Next(); break;
+                        case "--input": o.Input = Next(); break;
                         case "--gain":
                             if (!double.TryParse(Next(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out o.Gain) || o.Gain <= 0 || o.Gain > 20)
                                 throw new ArgumentException("--gain must be a number between 0 and 20");
