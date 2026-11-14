@@ -2,12 +2,13 @@ name: Build (Linux)
 
 # Builds dvmcli + libvocoder natively on ARM64 and x86-64 Linux runners, runs the offline
 # self-test on each, and uploads one tarball per architecture. Publishing a GitHub Release
-# (or pushing a v* tag) also attaches them.
+# also attaches them.
 
 on:
+  # No tag trigger: publishing a release also pushes its tag, and a second run uploading the
+  # same files at the same time made the two runs delete each other's uploads (--clobber).
   push:
     branches: [ main ]
-    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
   release:
@@ -88,7 +89,7 @@ jobs:
           path: out/${{ env.PKG }}.tar.gz*
 
       - name: Attach to release
-        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
