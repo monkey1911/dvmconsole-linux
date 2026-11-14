@@ -269,10 +269,10 @@ namespace dvmcli
             Check(Math.Abs(r.LevelDb - -19.03) < 0.3 && Math.Abs(r.PeakDb - -6.02) < 0.3,
                   $"mic meter: level falls 10 dB in 0.5 s and the peak is held ({r.LevelDb:F1} / {r.PeakDb:F1})");
 
-            m.Push(new short[160], t0.AddSeconds(2.2));
-            r = m.Read(t0.AddSeconds(2.2));
+            m.Push(new short[160], t0.AddSeconds(3.0));       // -19 dB at 0.5 s reaches the -60 floor about 2 s later
+            r = m.Read(t0.AddSeconds(3.0));
             Check(r.LevelDb <= LevelMeter.FloorDb + 0.01 && r.PeakDb <= LevelMeter.FloorDb + 0.01, "mic meter: the peak hold expires and silence reads as the floor");
-            Check(!m.Read(t0.AddSeconds(3)).Active, "mic meter: goes idle when audio stops");
+            Check(!m.Read(t0.AddSeconds(3.5)).Active, "mic meter: goes idle when audio stops");
 
             short[] loud = Sine(32767);
             m.Push(loud, t0.AddSeconds(4));
