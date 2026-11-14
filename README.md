@@ -1,22 +1,41 @@
-# dvmcli: DVM console proof of concept for Linux ARM64
+# dvmcli: DVM console proof of concept for Linux
 
-A headless test of the [DVM Desktop Dispatch Console](https://github.com/DVMProject/dvmconsole) on Linux aarch64 (built for Omarchy). It connects to an FNE as a console peer, follows one P25 talkgroup, decodes clear voice with libvocoder, and plays it through PipeWire.
+A headless test of the [DVM Desktop Dispatch Console](https://github.com/DVMProject/dvmconsole) on Linux, for ARM64 (aarch64) and x86-64. It was built for Omarchy on a Surface Pro 11 and runs the same way on x86-64 PCs. It connects to an FNE as a console peer, follows one P25 talkgroup, decodes clear voice with libvocoder, and plays it through PipeWire.
 
-It exists to prove the networking, vocoder and audio work on Linux ARM64 before any decision about a full desktop port.
+It exists to prove the networking, vocoder and audio work on Linux before any decision about a full desktop port.
 
 **What works:** FNE login using your dvmconsole codeplug, P25 receive and transmit (clear, AES-256, DES, ADP/ARC4 with keys from the FNE), PipeWire audio, a terminal console (channel cards, mouse support, toggle push-to-talk), and WAV recording.
 
 **Not yet:** DMR/NXDN/analog, and a graphical UI.
 
-## Install on the Surface Pro 11
+## Install
 
-Download the latest `dvmcli-*-linux-arm64.tar.gz` from the [Releases](../../releases) page (or from a CI run's artifacts), then extract it:
+Each release on the [Releases](../../releases) page has one download per architecture (CI runs keep the same two as artifacts):
+
+| Machine | Download |
+|---|---|
+| ARM64 (Surface Pro 11 and other aarch64) | `dvmcli-*-linux-arm64.tar.gz` |
+| x86-64 (Intel / AMD PCs) | `dvmcli-*-linux-x64.tar.gz` |
+
+If you're not sure which one a machine needs, this prints `aarch64` or `x86_64`:
+
+```bash
+uname -m
+```
+
+Extract the ARM64 build:
 
 ```bash
 tar -xzf ~/Downloads/dvmcli-*-linux-arm64.tar.gz -C ~
 ```
 
-The build is self-contained, so no .NET install is needed. Playback uses `pw-play`, which ships with PipeWire on Omarchy.
+Or the x86-64 build:
+
+```bash
+tar -xzf ~/Downloads/dvmcli-*-linux-x64.tar.gz -C ~
+```
+
+The builds are self-contained, so no .NET install is needed. They are built on Ubuntu 24.04, so any distribution of that age or newer runs them, including current Arch / Omarchy and Fedora. Playback uses `pw-play` and transmit uses `pw-record`, which ship with PipeWire.
 
 ## Codeplug
 
@@ -26,10 +45,10 @@ Keep codeplugs out of git; they contain passwords. This repo's `.gitignore` igno
 
 ## Use
 
-Change into the extracted folder (the name matches the release you downloaded):
+Change into the extracted folder (the name matches the release and architecture you downloaded):
 
 ```bash
-cd ~/dvmcli-*-linux-arm64
+cd ~/dvmcli-*-linux-*
 ```
 
 Run the offline self-test (vocoder, frame decoding, codeplug parsing):
@@ -116,13 +135,13 @@ Transmit uses the default PipeWire microphone and the system's `rid` as the sour
 
 ## Building from source
 
-CI builds every push on GitHub's ARM64 Linux runner. To build locally on Omarchy you need the .NET 10 SDK, CMake and a C++ compiler. Clone with submodules:
+CI builds every push on GitHub's ARM64 and x86-64 Linux runners. To build locally you need the .NET 10 SDK, CMake and a C++ compiler. Clone with submodules:
 
 ```bash
 git clone --recursive https://github.com/monkey1911/dvmconsole-linux.git
 ```
 
-Then follow the same steps as `.github/workflows/build.yml`.
+Then follow the same steps as `.github/workflows/build.yml`, with `linux-arm64` or `linux-x64` as the runtime identifier.
 
 ## How it is put together
 

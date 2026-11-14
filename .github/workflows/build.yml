@@ -1,7 +1,8 @@
-name: Build (Linux ARM64)
+name: Build (Linux)
 
-# Builds dvmcli + libvocoder natively on an ARM64 Linux runner, runs the offline self-test,
-# and uploads a tarball. Publishing a GitHub Release (or pushing a v* tag) also attaches it.
+# Builds dvmcli + libvocoder natively on ARM64 and x86-64 Linux runners, runs the offline
+# self-test on each, and uploads one tarball per architecture. Publishing a GitHub Release
+# (or pushing a v* tag) also attaches them.
 
 on:
   push:
@@ -18,10 +19,25 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    name: build (linux-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # arch is the .NET runtime identifier suffix; elf is what file(1) calls the machine
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            elf: aarch64
+          - arch: x64
+            runner: ubuntu-24.04
+            elf: x86-64
 
     env:
       TAG: ${{ github.event.release.tag_name || github.ref_name }}
+      RID: linux-${{ matrix.arch }}
+      ELF: ${{ matrix.elf }}
 
     steps:
       - name: Checkout
@@ -34,41 +50,41 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Build libvocoder (aarch64)
+      - name: Build libvocoder
         run: |
           cmake -S extern/dvmvocoder -B build/vocoder -DCMAKE_BUILD_TYPE=Release
           cmake --build build/vocoder -j"$(nproc)"
           mkdir -p build/native
           cp "$(find build/vocoder -name 'libvocoder.so' | head -1)" build/native/
 
-      - name: Publish dvmcli (linux-arm64, self-contained)
-        run: dotnet publish src/dvmcli/dvmcli.csproj -c Release -r linux-arm64 --self-contained true -o out/dvmcli-linux-arm64
+      - name: Publish dvmcli (self-contained)
+        run: dotnet publish src/dvmcli/dvmcli.csproj -c Release -r "$RID" --self-contained true -o "out/dvmcli-$RID"
 
-      - name: Verify binaries are aarch64
+      - name: Verify binaries match the target architecture
         run: |
           for f in dvmcli libvocoder.so; do
-            test -f "out/dvmcli-linux-arm64/$f" || { echo "::error::$f missing from publish output"; exit 1; }
-            desc="$(file -b "out/dvmcli-linux-arm64/$f")"
+            test -f "out/dvmcli-$RID/$f" || { echo "::error::$f missing from publish output"; exit 1; }
+            desc="$(file -b "out/dvmcli-$RID/$f")"
             echo "$f: $desc"
-            case "$desc" in *aarch64*|*"ARM aarch64"*) ;; *) echo "::error::$f is not aarch64"; exit 1;; esac
+            case "$desc" in *"$ELF"*) ;; *) echo "::error::$f is not $ELF"; exit 1;; esac
           done
 
       - name: Self-test
-        run: out/dvmcli-linux-arm64/dvmcli selftest
+        run: out/dvmcli-$RID/dvmcli selftest
 
       - name: Package
         run: |
-          cp README.md LICENSE out/dvmcli-linux-arm64/
-          name="dvmcli-${TAG//\//-}-linux-arm64"
+          cp README.md LICENSE "out/dvmcli-$RID/"
+          name="dvmcli-${TAG//\//-}-$RID"
           echo "PKG=$name" >> "$GITHUB_ENV"
-          mv out/dvmcli-linux-arm64 "out/$name"
+          mv "out/dvmcli-$RID" "out/$name"
           tar -C out -czf "out/$name.tar.gz" "$name"
           (cd out && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: dvmcli-linux-arm64
+          name: dvmcli-linux-${{ matrix.arch }}
           path: out/${{ env.PKG }}.tar.gz*
 
       - name: Attach to release
@@ -76,9 +92,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" "out/$PKG.tar.gz" "out/$PKG.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            gh release create "$TAG" "out/$PKG.tar.gz" "out/$PKG.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" \
-              --title "dvmcli $TAG (Linux ARM64)" --prerelease --notes "Linux ARM64 proof of concept build. See README for usage."
+          # Both architecture jobs run this at once, so creating the release can lose a race
+          # with the other job; whoever loses just uploads to the release the winner made.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "dvmcli $TAG (Linux)" --prerelease \
+              --notes "Linux proof of concept builds for ARM64 and x86-64. See README for usage." \
+              || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           fi
+          gh release upload "$TAG" "out/$PKG.tar.gz" "out/$PKG.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" --clobber

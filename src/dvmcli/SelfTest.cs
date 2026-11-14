@@ -2,7 +2,7 @@
 /**
 * dvmcli - headless Linux proof of concept for the DVM Desktop Dispatch Console.
 *
-* Offline self-test, run by CI on Linux ARM64. It checks that libvocoder loads, that
+* Offline self-test, run by CI on Linux ARM64 and x86-64. It checks that libvocoder loads, that
 * IMBE encode/decode round-trips, that the receiver pulls the nine codewords out of an
 * LDU frame and handles calls, that encrypted calls decrypt to exactly the clear audio,
 * and that codeplugs and WAV files are read/written correctly. It does not touch the network.

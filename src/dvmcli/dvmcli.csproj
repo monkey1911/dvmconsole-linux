@@ -12,7 +12,7 @@
     <AssemblyName>dvmcli</AssemblyName>
     <RootNamespace>dvmcli</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <Version>0.7.1</Version>
+    <Version>0.7.2</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
